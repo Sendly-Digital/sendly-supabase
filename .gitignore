@@ -1,0 +1,8 @@
+functions/arc/old/
+functions/arc/server/backaups/
+
+*.zip
+
+tempo/
+
+.agents/
