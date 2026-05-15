@@ -4,8 +4,6 @@ import { logger } from 'npm:hono/logger';
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { ethers } from 'npm:ethers@6';
 import * as kv from './kv_store.tsx';
-import { UnifiedBalanceKit } from 'npm:@circle-fin/unified-balance-kit';
-import { createCircleWalletsAdapter } from 'npm:@circle-fin/adapter-circle-wallets';
 
 // RPC providers per chain for fetching transaction sender addresses
 const DEFAULT_ARC_RPC = 'https://arc-testnet.g.alchemy.com/v2/txtfxuHRReih2Iv9VpLUS9Ku6ZuztEQL';
@@ -17,19 +15,6 @@ const RPC_URLS: Record<number, string> = {
   84532: Deno.env.get('BASE_RPC_URL') || DEFAULT_BASE_SEPOLIA_RPC,
 };
 const rpcProviderCache: Record<number, ethers.JsonRpcProvider> = {};
-
-// Gateway unified balance config
-const CIRCLE_API_KEY = Deno.env.get('CIRCLE_API_KEY') ?? '';
-const CIRCLE_ENTITY_SECRET = Deno.env.get('CIRCLE_ENTITY_SECRET') ?? '';
-
-const GATEWAY_CHAIN_MAP: Record<string, string> = {
-  'Arc Testnet': 'Arc_Testnet',
-  'Base Sepolia': 'Base_Sepolia',
-};
-const GATEWAY_BLOCKCHAIN_MAP: Record<string, string> = {
-  'ARC-TESTNET': 'Arc_Testnet',
-  'BASE-SEPOLIA': 'Base_Sepolia',
-};
 
 function getRpcProvider(chainId: number = 5042002): ethers.JsonRpcProvider {
   const url = RPC_URLS[chainId] || RPC_URLS[5042002];
@@ -9015,40 +9000,123 @@ app.post('/graph/fill-missing-senders', async (c) => {
 
 // ─── Gateway Unified Balance Routes ───
 
-app.post('/gateway-deposit', async (c) => {
-  if (!CIRCLE_API_KEY || !CIRCLE_ENTITY_SECRET) {
-    return c.json({ success: false, error: 'Server configuration error: missing Circle API credentials' }, 500);
+const GATEWAY_WALLET = '0x0077777d7EBA4688BDeF3E311b846F25870A19B9';
+const GATEWAY_MINTER = '0x0022222ABE238Cc2C7Bb1f21003F0a260052475B';
+const GATEWAY_API = 'https://gateway-api-testnet.circle.com/v1';
+const GATEWAY_MAX_FEE = '2010000';
+
+const USDC_MAP: Record<string, string> = {
+  'ARC-TESTNET': '0x3600000000000000000000000000000000000000',
+  'BASE-SEPOLIA': '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+};
+const DOMAIN_MAP: Record<string, number> = {
+  'ARC-TESTNET': 26,
+  'BASE-SEPOLIA': 6,
+};
+
+function padBytes32(addr: string): string {
+  return '0x' + addr.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+}
+
+function parseUsdc6(amount: string): string {
+  const [whole = '0', dec = ''] = String(amount).split('.');
+  return (whole || '0') + (dec + '000000').slice(0, 6);
+}
+
+type CircleAuthResult =
+  | { ok: true; apiKey: string; ciphertext: string }
+  | { ok: false; error: string };
+
+async function getCircleAuth(): Promise<CircleAuthResult> {
+  const apiKey = Deno.env.get('CIRCLE_API_KEY');
+  const secret = Deno.env.get('CIRCLE_ENTITY_SECRET');
+  if (!apiKey || !secret) {
+    return {
+      ok: false,
+      error:
+        'Missing CIRCLE_API_KEY or CIRCLE_ENTITY_SECRET — add them as secrets for this Edge function (Dashboard → Edge Functions → Secrets), not only in the SPA .env',
+    };
   }
 
   try {
-    const { walletAddress, chain, amount } = await c.req.json();
+    const hexSecret = secret.trim().replace(/^0x/i, '');
+    const ciphertext = await reEncryptEntitySecretCiphertextGlobal(apiKey, hexSecret);
+    return { ok: true, apiKey, ciphertext };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { ok: false, error: `Entity secret ciphertext (RSA-OAEP): ${message}` };
+  }
+}
 
-    if (!walletAddress || !amount) {
-      return c.json({ success: false, error: `Missing: ${!walletAddress ? 'walletAddress' : 'amount'}` }, 400);
+app.post('/gateway-deposit', async (c) => {
+  try {
+    const auth = await getCircleAuth();
+    if (!auth.ok) {
+      console.error('gateway-deposit Circle auth:', auth.error);
+      return c.json({ success: false, error: 'Circle auth failed', details: auth.error }, 500);
     }
 
-    const sdkChain = GATEWAY_CHAIN_MAP[chain];
-    if (!sdkChain) {
-      return c.json({ success: false, error: `Unsupported chain: ${chain}` }, 400);
+    const { walletAddress, chain, amount, blockchain } = await c.req.json();
+    const DISPLAY_TO_BC: Record<string, string> = {
+      'arc testnet': 'ARC-TESTNET',
+      'base sepolia': 'BASE-SEPOLIA',
+    };
+    let bc = String(blockchain || chain || '').trim();
+    if (!USDC_MAP[bc]) {
+      const mapped = DISPLAY_TO_BC[bc.toLowerCase()];
+      if (mapped) bc = mapped;
     }
+    const usdc = USDC_MAP[bc];
+    if (!usdc) return c.json({ success: false, error: `Unsupported chain: ${bc}` }, 400);
+    if (!walletAddress || !amount) return c.json({ success: false, error: 'Missing walletAddress or amount' }, 400);
 
-    const adapter = createCircleWalletsAdapter({ apiKey: CIRCLE_API_KEY, entitySecret: CIRCLE_ENTITY_SECRET });
-    const kit = new UnifiedBalanceKit();
+    const supabase = getSupabaseClient();
+    const { data: wallet } = await supabase
+      .from('developer_wallets')
+      .select('*')
+      .eq('wallet_address', walletAddress.toLowerCase())
+      .single();
+    if (!wallet) return c.json({ success: false, error: 'Internal Wallet not found' }, 404);
 
-    const result = await kit.deposit({
-      from: { adapter, chain: sdkChain, address: walletAddress },
-      amount,
+    const circleEntitySecretHex = Deno.env.get('CIRCLE_ENTITY_SECRET')!.trim().replace(/^0x/i, '');
+
+    const parsed = parseUsdc6(amount);
+
+    const execTx = async (overrides: Record<string, unknown>) => {
+      const ciphertext = await reEncryptEntitySecretCiphertextGlobal(auth.apiKey, circleEntitySecretHex);
+      return fetch('https://api.circle.com/v1/w3s/developer/transactions/contractExecution', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${auth.apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          walletId: wallet.circle_wallet_id,
+          entitySecretCiphertext: ciphertext,
+          feeLevel: 'MEDIUM',
+          idempotencyKey: crypto.randomUUID(),
+          ...overrides,
+        }),
+      });
+    };
+
+    const appRes = await execTx({
+      contractAddress: usdc,
+      abiFunctionSignature: 'approve(address,uint256)',
+      abiParameters: [GATEWAY_WALLET, parsed],
     });
+    if (!appRes.ok) return c.json({ success: false, error: `Approve failed: ${await appRes.text()}` }, 500);
+    const appData = await appRes.json();
+    const approveId = appData?.data?.id;
+    if (!approveId) return c.json({ success: false, error: 'No approve transaction ID' }, 500);
 
-    return c.json({
-      success: true,
-      data: {
-        txHash: result.txHash,
-        explorerUrl: result.explorerUrl,
-        amount: result.amount,
-        chain: result.chain,
-      },
+    const depRes = await execTx({
+      contractAddress: GATEWAY_WALLET,
+      abiFunctionSignature: 'deposit(address,uint256)',
+      abiParameters: [usdc, parsed],
     });
+    if (!depRes.ok) return c.json({ success: false, error: `Deposit failed: ${await depRes.text()}` }, 500);
+    const depData = await depRes.json();
+    const depositId = depData?.data?.id;
+
+    return c.json({ success: true, data: { approveTransactionId: approveId, depositTransactionId: depositId, amount, chain: bc } });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     console.error('gateway-deposit:', msg);
@@ -9057,46 +9125,107 @@ app.post('/gateway-deposit', async (c) => {
 });
 
 app.post('/gateway-spend', async (c) => {
-  if (!CIRCLE_API_KEY || !CIRCLE_ENTITY_SECRET) {
-    return c.json({ success: false, error: 'Server configuration error' }, 500);
-  }
-
   try {
+    const auth = await getCircleAuth();
+    if (!auth.ok) {
+      console.error('gateway-spend Circle auth:', auth.error);
+      return c.json({ success: false, error: 'Circle auth failed', details: auth.error }, 500);
+    }
+
     const { walletAddress, sourceBlockchain, destinationBlockchain, recipientAddress, amount } = await c.req.json();
+    if (!walletAddress || !amount || !recipientAddress) return c.json({ success: false, error: 'Missing required params' }, 400);
 
-    if (!walletAddress || !amount || !recipientAddress) {
-      return c.json({ success: false, error: 'Missing required parameters' }, 400);
-    }
+    const srcUsdc = USDC_MAP[sourceBlockchain];
+    const dstUsdc = USDC_MAP[destinationBlockchain];
+    const srcDomain = DOMAIN_MAP[sourceBlockchain];
+    const dstDomain = DOMAIN_MAP[destinationBlockchain];
+    if (!srcUsdc || !dstUsdc || srcDomain == null || dstDomain == null) return c.json({ success: false, error: 'Unsupported chain' }, 400);
 
-    const sourceChain = GATEWAY_BLOCKCHAIN_MAP[sourceBlockchain];
-    const destChain = GATEWAY_BLOCKCHAIN_MAP[destinationBlockchain];
+    const supabase = getSupabaseClient();
+    const { data: wallet } = await supabase
+      .from('developer_wallets')
+      .select('*')
+      .eq('wallet_address', walletAddress.toLowerCase())
+      .single();
+    if (!wallet) return c.json({ success: false, error: 'Internal Wallet not found' }, 404);
 
-    if (!sourceChain) return c.json({ success: false, error: `Unsupported source: ${sourceBlockchain}` }, 400);
-    if (!destChain) return c.json({ success: false, error: `Unsupported destination: ${destinationBlockchain}` }, 400);
-    if (!/^0x[a-fA-F0-9]{40}$/.test(recipientAddress)) {
-      return c.json({ success: false, error: 'Invalid recipient address' }, 400);
-    }
+    const parsed = parseUsdc6(amount);
+    const salt = '0x' + Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, '0')).join('');
 
-    const adapter = createCircleWalletsAdapter({ apiKey: CIRCLE_API_KEY, entitySecret: CIRCLE_ENTITY_SECRET });
-    const kit = new UnifiedBalanceKit();
+    const circleEntitySecretHex = Deno.env.get('CIRCLE_ENTITY_SECRET')!.trim().replace(/^0x/i, '');
 
-    const result = await kit.spend({
-      from: { adapter, address: walletAddress, allocations: { amount, chain: sourceChain } },
-      to: { chain: destChain, recipientAddress },
-      amount,
-    });
-
-    return c.json({
-      success: true,
-      data: {
-        txHash: result.txHash,
-        explorerUrl: result.explorerUrl,
-        transferId: result.transferId,
-        destinationChain: result.destinationChain,
-        recipientAddress: result.recipientAddress,
-        allocations: result.allocations,
+    const burnIntent = {
+      maxBlockHeight: '115792089237316195423570985008687907853269984665640564039457584007913129639935',
+      maxFee: GATEWAY_MAX_FEE,
+      spec: {
+        version: 1, sourceDomain: srcDomain, destinationDomain: dstDomain,
+        sourceContract: padBytes32(GATEWAY_WALLET), destinationContract: padBytes32(GATEWAY_MINTER),
+        sourceToken: padBytes32(srcUsdc), destinationToken: padBytes32(dstUsdc),
+        sourceDepositor: padBytes32(walletAddress), destinationRecipient: padBytes32(recipientAddress),
+        sourceSigner: padBytes32(walletAddress), destinationCaller: padBytes32('0x0000000000000000000000000000000000000000'),
+        value: parsed, salt: padBytes32(salt), hookData: '0x',
       },
+    };
+
+    const signCiphertext = await reEncryptEntitySecretCiphertextGlobal(auth.apiKey, circleEntitySecretHex);
+    const signRes = await fetch(`https://api.circle.com/v1/w3s/developer/wallets/${wallet.circle_wallet_id}/signTypedData`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${auth.apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        typedData: {
+          domain: { name: 'GatewayWallet', version: '1' },
+          types: {
+            EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }],
+            TransferSpec: [
+              { name: 'version', type: 'uint32' }, { name: 'sourceDomain', type: 'uint32' }, { name: 'destinationDomain', type: 'uint32' },
+              { name: 'sourceContract', type: 'bytes32' }, { name: 'destinationContract', type: 'bytes32' },
+              { name: 'sourceToken', type: 'bytes32' }, { name: 'destinationToken', type: 'bytes32' },
+              { name: 'sourceDepositor', type: 'bytes32' }, { name: 'destinationRecipient', type: 'bytes32' },
+              { name: 'sourceSigner', type: 'bytes32' }, { name: 'destinationCaller', type: 'bytes32' },
+              { name: 'value', type: 'uint256' }, { name: 'salt', type: 'bytes32' }, { name: 'hookData', type: 'bytes' },
+            ],
+            BurnIntent: [
+              { name: 'maxBlockHeight', type: 'uint256' }, { name: 'maxFee', type: 'uint256' }, { name: 'spec', type: 'TransferSpec' },
+            ],
+          },
+          primaryType: 'BurnIntent',
+        },
+        entitySecretCiphertext: signCiphertext,
+        idempotencyKey: crypto.randomUUID(),
+      }),
     });
+    if (!signRes.ok) return c.json({ success: false, error: `EIP-712 signing failed: ${await signRes.text()}` }, 500);
+    const signData = await signRes.json();
+    const signature = signData?.data?.signature;
+    if (!signature) return c.json({ success: false, error: 'No signature' }, 500);
+
+    const gwRes = await fetch(`${GATEWAY_API}/transfer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify([{ burnIntent, signature }], (_, v) => typeof v === 'bigint' ? v.toString() : v),
+    });
+    if (!gwRes.ok) return c.json({ success: false, error: `Gateway transfer: ${await gwRes.text()}` }, 500);
+    const [gwItem] = await gwRes.json();
+    if (!gwItem?.attestation) return c.json({ success: false, error: 'No attestation' }, 500);
+
+    const mintCiphertext = await reEncryptEntitySecretCiphertextGlobal(auth.apiKey, circleEntitySecretHex);
+    const mintRes = await fetch('https://api.circle.com/v1/w3s/developer/transactions/contractExecution', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${auth.apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        walletId: wallet.circle_wallet_id,
+        contractAddress: GATEWAY_MINTER,
+        abiFunctionSignature: 'gatewayMint(bytes,bytes)',
+        abiParameters: [gwItem.attestation, gwItem.signature],
+        entitySecretCiphertext: mintCiphertext,
+        feeLevel: 'MEDIUM',
+        idempotencyKey: crypto.randomUUID(),
+      }),
+    });
+    if (!mintRes.ok) return c.json({ success: false, error: `Mint failed: ${await mintRes.text()}` }, 500);
+    const mintData = await mintRes.json();
+
+    return c.json({ success: true, data: { mintTransactionId: mintData?.data?.id, amount, destinationChain: destinationBlockchain, recipientAddress, attestation: gwItem.attestation } });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     console.error('gateway-spend:', msg);
@@ -9120,11 +9249,21 @@ Deno.serve(async (req) => {
     let pathname = url.pathname;
     console.log(`Incoming request: ${req.method} ${pathname}`);
     
-    // Remove function name prefix from path
-    // Supabase passes path as /smart-action/..., but Hono expects only path after function name
-    if (pathname.startsWith('/smart-action')) {
-      pathname = pathname.replace('/smart-action', '') || '/';
-      console.log(`Normalized path: ${pathname}`);
+    // Remove Edge Function slug prefix so Hono matches app routes (e.g. /gateway-deposit).
+    // Path is often /{functionSlug}/rest (e.g. /smooth-processor/gateway-deposit).
+    const functionSlug = Deno.env.get('SUPABASE_FUNCTION_NAME')?.trim();
+    const slugPrefixes = [
+      ...(functionSlug ? [`/${functionSlug}`] : []),
+      '/smart-action-v2',
+      '/smart-action',
+      '/smooth-processor',
+    ];
+    for (const prefix of slugPrefixes) {
+      if (pathname === prefix || pathname.startsWith(`${prefix}/`)) {
+        pathname = pathname.slice(prefix.length) || '/';
+        console.log(`Normalized path (stripped ${prefix}): ${pathname}`);
+        break;
+      }
     }
     
     // Handle OPTIONS requests with normalized path
