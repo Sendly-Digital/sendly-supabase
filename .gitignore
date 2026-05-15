@@ -5,4 +5,15 @@ functions/arc/server/backaups/
 
 tempo/
 
+<<<<<<< Updated upstream
 .agents/
+=======
+.agents/
+supabase_fix/
+
+
+# Public repo cleanup: local/prod copies and old migration drafts
+functions/arc/zk-sender/index prod 2.2.ts
+migrations/040_OLD_update_recalculate_leaderboard_stats_chain_id.sql
+migrations/041_OLD_update_recalculate_leaderboard_stats_graph_true_chain_id.sql
+>>>>>>> Stashed changes
