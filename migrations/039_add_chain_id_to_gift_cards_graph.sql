@@ -31,7 +31,7 @@ ALTER TABLE public.gift_cards_graph DROP CONSTRAINT IF EXISTS gift_cards_graph_t
 DROP INDEX IF EXISTS gift_cards_graph_token_id_key;
 DROP INDEX IF EXISTS gift_cards_graph_token_id_unique;
 
--- If this fails: duplicate (chain_id, token_id) rows exist — dedupe first.
+-- If this fails: duplicate (chain_id, token_id) rows exist - dedupe first.
 CREATE UNIQUE INDEX IF NOT EXISTS gift_cards_graph_chain_id_token_id_unique
   ON public.gift_cards_graph (chain_id, token_id);
 

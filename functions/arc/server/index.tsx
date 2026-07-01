@@ -3,6 +3,7 @@ import { cors } from 'npm:hono/cors';
 import { logger } from 'npm:hono/logger';
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { ethers } from 'npm:ethers@6';
+import { encodeFunctionData } from 'npm:viem';
 import * as kv from './kv_store.tsx';
 
 // RPC providers per chain for fetching transaction sender addresses
@@ -346,6 +347,75 @@ function normalizeWalletAddress(address: string | null | undefined) {
 
 function normalizeBlockchain(blockchain: string | null | undefined) {
   return typeof blockchain === 'string' ? blockchain.trim().toUpperCase() : null;
+}
+
+const ARC_USDC_CONTRACT_LOWER = '0x3600000000000000000000000000000000000000';
+
+/** CCTP Bridge Kit uses increaseAllowance; Arc USDC internal-wallet flows use approve (same as gift cards). */
+function remapArcUsdcAllowanceFunction(
+  blockchain: string,
+  contractAddress: string,
+  functionName: string
+): string {
+  if (
+    normalizeBlockchain(blockchain) === 'ARC-TESTNET' &&
+    contractAddress.toLowerCase() === ARC_USDC_CONTRACT_LOWER &&
+    functionName === 'increaseAllowance'
+  ) {
+    return 'approve';
+  }
+  return functionName;
+}
+
+async function pollCircleW3sTransactionStatus(
+  transactionId: string,
+  circleApiKey: string,
+  entitySecretCiphertext: string,
+  maxWaitMs = 90_000
+): Promise<{ txHash?: string; transactionState?: string; error?: string }> {
+  const baseHeaders: Record<string, string> = {
+    Authorization: `Bearer ${circleApiKey}`,
+    'Content-Type': 'application/json',
+  };
+  const developerHeaders = {
+    ...baseHeaders,
+    'X-Entity-Secret-Ciphertext': entitySecretCiphertext,
+  };
+  const commonUrl = `https://api.circle.com/v1/w3s/transactions/${transactionId}`;
+  const developerUrl = `https://api.circle.com/v1/w3s/developer/transactions/${transactionId}`;
+  const failStates = new Set(['FAILED', 'DENIED', 'CANCELLED']);
+  const okStates = new Set(['COMPLETE', 'CONFIRMED', 'SETTLED']);
+  const started = Date.now();
+
+  while (Date.now() - started < maxWaitMs) {
+    let response = await fetch(commonUrl, { method: 'GET', headers: baseHeaders });
+    if (!response.ok) {
+      response = await fetch(developerUrl, { method: 'GET', headers: developerHeaders });
+    }
+    if (response.ok) {
+      const result = await response.json();
+      const transactionData = result.data?.transaction || result.data;
+      const state: string | undefined = transactionData?.state || result.data?.state;
+      const hash: string | undefined =
+        transactionData?.hash || transactionData?.txHash || transactionData?.transactionHash;
+
+      if (state && failStates.has(state)) {
+        return {
+          transactionState: state,
+          error: transactionData?.errorReason || transactionData?.errorDetails || `Circle transaction ${state}`,
+        };
+      }
+      if (hash && state && okStates.has(state)) {
+        return { txHash: hash, transactionState: state };
+      }
+      if (hash && (state === 'SENT' || state === 'CONFIRMING' || state === 'QUEUED')) {
+        return { txHash: hash, transactionState: state };
+      }
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  return { error: 'Timed out waiting for Circle transaction confirmation' };
 }
 
 function normalizeTelegramId(telegramId: string | number | null | undefined) {
@@ -6219,8 +6289,8 @@ const GiftCardABI = [
   }
 ];
 
-// Minimal ERC20 ABI (approve only) to support allowance scenarios
-const ERC20_MIN_ABI = [
+// ERC-20 allowance helpers (Circle USDC uses increaseAllowance for CCTP v2 bridge approve step)
+const ERC20_ALLOWANCE_ABI = [
   {
     "inputs": [
       { "internalType": "address", "name": "spender", "type": "address" },
@@ -6230,7 +6300,136 @@ const ERC20_MIN_ABI = [
     "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
     "stateMutability": "nonpayable",
     "type": "function"
+  },
+  {
+    "inputs": [
+      { "internalType": "address", "name": "spender", "type": "address" },
+      { "internalType": "uint256", "name": "increment", "type": "uint256" }
+    ],
+    "name": "increaseAllowance",
+    "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      { "internalType": "address", "name": "spender", "type": "address" },
+      { "internalType": "uint256", "name": "decrement", "type": "uint256" }
+    ],
+    "name": "decreaseAllowance",
+    "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+    "stateMutability": "nonpayable",
+    "type": "function"
   }
+];
+
+const ERC20_ALLOWANCE_FUNCTION_NAMES = new Set([
+  'approve',
+  'increaseAllowance',
+  'decreaseAllowance',
+]);
+
+// CCTP v2 TokenMessenger / MessageTransmitter (Internal Wallet bridge burn & mint)
+const CCTP_V2_BRIDGE_ABI = [
+  {
+    "inputs": [
+      { "internalType": "uint256", "name": "amount", "type": "uint256" },
+      { "internalType": "uint32", "name": "destinationDomain", "type": "uint32" },
+      { "internalType": "bytes32", "name": "mintRecipient", "type": "bytes32" },
+      { "internalType": "address", "name": "burnToken", "type": "address" },
+      { "internalType": "bytes32", "name": "destinationCaller", "type": "bytes32" },
+      { "internalType": "uint256", "name": "maxFee", "type": "uint256" },
+      { "internalType": "uint32", "name": "minFinalityThreshold", "type": "uint32" }
+    ],
+    "name": "depositForBurn",
+    "outputs": [{ "internalType": "uint64", "name": "nonce", "type": "uint64" }],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      { "internalType": "uint256", "name": "amount", "type": "uint256" },
+      { "internalType": "uint32", "name": "destinationDomain", "type": "uint32" },
+      { "internalType": "bytes32", "name": "mintRecipient", "type": "bytes32" },
+      { "internalType": "address", "name": "burnToken", "type": "address" },
+      { "internalType": "bytes32", "name": "destinationCaller", "type": "bytes32" },
+      { "internalType": "uint256", "name": "maxFee", "type": "uint256" },
+      { "internalType": "uint32", "name": "minFinalityThreshold", "type": "uint32" },
+      { "internalType": "bytes", "name": "hookData", "type": "bytes" }
+    ],
+    "name": "depositForBurnWithHook",
+    "outputs": [{ "internalType": "uint64", "name": "nonce", "type": "uint64" }],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      { "internalType": "bytes", "name": "message", "type": "bytes" },
+      { "internalType": "bytes", "name": "attestation", "type": "bytes" }
+    ],
+    "name": "receiveMessage",
+    "outputs": [{ "internalType": "bool", "name": "success", "type": "bool" }],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+];
+
+const CCTP_V2_FUNCTION_NAMES = new Set([
+  'depositForBurn',
+  'depositForBurnWithHook',
+  'receiveMessage',
+]);
+
+/** Circle BridgingKit - Arc CCTP burn uses bridgeWithPreapproval on this contract (not TokenMessenger). */
+const CIRCLE_BRIDGE_KIT_CONTRACT_LOWER = '0xc5567a5e3370d4dbfbf0540025078e283e36a363d';
+
+const CIRCLE_BRIDGE_KIT_FUNCTION_NAMES = new Set([
+  'bridgeWithPreapproval',
+  'bridgeWithPreapprovalAndHook',
+]);
+
+const BRIDGE_PARAMS_COMPONENTS = [
+  { internalType: 'uint256', name: 'amount', type: 'uint256' },
+  { internalType: 'uint256', name: 'maxFee', type: 'uint256' },
+  { internalType: 'uint256', name: 'fee', type: 'uint256' },
+  { internalType: 'bytes32', name: 'mintRecipient', type: 'bytes32' },
+  { internalType: 'bytes32', name: 'destinationCaller', type: 'bytes32' },
+  { internalType: 'address', name: 'burnToken', type: 'address' },
+  { internalType: 'address', name: 'feeRecipient', type: 'address' },
+  { internalType: 'uint32', name: 'destinationDomain', type: 'uint32' },
+  { internalType: 'uint32', name: 'minFinalityThreshold', type: 'uint32' },
+];
+
+const CIRCLE_BRIDGE_KIT_ABI = [
+  {
+    inputs: [
+      {
+        components: BRIDGE_PARAMS_COMPONENTS,
+        internalType: 'struct BridgingKitContract.BridgeParams',
+        name: 'bridgeParams',
+        type: 'tuple',
+      },
+    ],
+    name: 'bridgeWithPreapproval',
+    outputs: [],
+    stateMutability: 'nonpayable',
+    type: 'function',
+  },
+  {
+    inputs: [
+      {
+        components: BRIDGE_PARAMS_COMPONENTS,
+        internalType: 'struct BridgingKitContract.BridgeParams',
+        name: 'bridgeParams',
+        type: 'tuple',
+      },
+      { internalType: 'bytes', name: 'hookData', type: 'bytes' },
+    ],
+    name: 'bridgeWithPreapprovalAndHook',
+    outputs: [],
+    stateMutability: 'nonpayable',
+    type: 'function',
+  },
 ];
 
 // ZkSend ABI for createPayment, claimPayment, claimPayments (docs/smart-action-zksend-abi.md)
@@ -6356,6 +6555,13 @@ const DirectSendABI = [
   }
 ];
 
+function abiInputToSignatureType(input: any): string {
+  if (input.type === 'tuple' && Array.isArray(input.components)) {
+    return `(${input.components.map((c: any) => abiInputToSignatureType(c)).join(',')})`;
+  }
+  return input.type;
+}
+
 // Helper function to get function signature
 function getFunctionSignature(functionName: string, abi: any[]): string {
   const func = abi.find((item: any) => item.name === functionName && item.type === 'function');
@@ -6363,8 +6569,93 @@ function getFunctionSignature(functionName: string, abi: any[]): string {
     throw new Error(`Function ${functionName} not found in ABI`);
   }
   
-  const params = func.inputs.map((input: any) => input.type).join(',');
+  const params = func.inputs.map((input: any) => abiInputToSignatureType(input)).join(',');
   return `${functionName}(${params})`;
+}
+
+function serializeCircleAbiArg(arg: any): any {
+  if (typeof arg === 'bigint') {
+    return arg.toString();
+  }
+  if (Array.isArray(arg)) {
+    return arg.map(serializeCircleAbiArg);
+  }
+  if (arg !== null && typeof arg === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(arg)) {
+      out[key] = serializeCircleAbiArg(value);
+    }
+    return out;
+  }
+  if (typeof arg === 'number') {
+    return arg.toString();
+  }
+  return arg;
+}
+
+const ZKSEND_CLAIM_FUNCTION_NAMES = new Set(['claimPayment', 'claimPayments']);
+
+function getZkSendContractAddressLower(): string {
+  return (Deno.env.get('ZKSEND_CONTRACT_ADDRESS') || Deno.env.get('VITE_ARC_ZKSEND_CONTRACT_ADDRESS') || '')
+    .trim()
+    .toLowerCase();
+}
+
+/** Normalize JSON args for viem encodeFunctionData (ZkSend claim tuples). */
+function parseArgForViem(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+  if (Array.isArray(value)) {
+    return value.map(parseArgForViem);
+  }
+  if (typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = parseArgForViem(val);
+    }
+    return out;
+  }
+  if (typeof value === 'string') {
+    if (value.startsWith('0x')) return value as `0x${string}`;
+    if (/^\d+$/.test(value)) return BigInt(value);
+    return value;
+  }
+  if (typeof value === 'number' && Number.isInteger(value)) return value;
+  return value;
+}
+
+function coerceUint256Arg(value: unknown): unknown {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number' && Number.isInteger(value)) return BigInt(value);
+  if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value);
+  return value;
+}
+
+function parseZkSendClaimArgs(functionName: string, args: unknown[]): unknown[] {
+  const parsed = args.map(parseArgForViem);
+  if (functionName === 'claimPayment' && parsed.length > 0) {
+    parsed[0] = coerceUint256Arg(parsed[0]);
+  }
+  if (functionName === 'claimPayments' && parsed.length > 0 && Array.isArray(parsed[0])) {
+    parsed[0] = (parsed[0] as unknown[]).map(coerceUint256Arg);
+  }
+  return parsed;
+}
+
+function encodeZkSendClaimCallData(
+  functionName: string,
+  args: unknown[],
+): { ok: true; callData: `0x${string}` } | { ok: false; error: string } {
+  try {
+    const viemArgs = parseZkSendClaimArgs(functionName, args);
+    const callData = encodeFunctionData({
+      abi: ZkSendABI,
+      functionName: functionName as 'claimPayment' | 'claimPayments',
+      args: viemArgs as any,
+    });
+    return { ok: true, callData };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 // Create Developer wallet for social account
@@ -6645,22 +6936,36 @@ app.get('/wallets/get-by-social', async (c) => {
 // Send transaction via Developer wallet (CRITICAL)
 app.post('/wallets/send-transaction', async (c) => {
   try {
+    const body = await c.req.json();
     const { 
       walletId, 
       walletAddress, 
       contractAddress, 
-      functionName, 
       args, 
       blockchain,
       privyUserId,
       socialPlatform,
       socialUserId
-    } = await c.req.json();
+    } = body;
+    const callDataRaw = body?.callData ?? body?.call_data;
+    const useCallData = typeof callDataRaw === 'string' && callDataRaw.startsWith('0x');
+    const rawFunctionName = body?.functionName ?? body?.function_name;
+    const functionName = rawFunctionName
+      ? remapArcUsdcAllowanceFunction(blockchain, contractAddress, rawFunctionName)
+      : undefined;
 
-    if (!walletId || !walletAddress || !contractAddress || !functionName || !args || !blockchain) {
+    if (!walletId || !walletAddress || !contractAddress || !blockchain) {
       return c.json({ 
         error: 'Missing required fields',
-        required: ['walletId', 'walletAddress', 'contractAddress', 'functionName', 'args', 'blockchain']
+        required: ['walletId', 'walletAddress', 'contractAddress', 'blockchain']
+      }, 400);
+    }
+
+    if (!useCallData && (!functionName || args === undefined || args === null)) {
+      return c.json({
+        error: 'Missing required fields',
+        required: ['functionName', 'args'],
+        hint: 'Or send pre-encoded callData for tuple-heavy contract calls',
       }, 400);
     }
 
@@ -6847,6 +7152,8 @@ app.post('/wallets/send-transaction', async (c) => {
     let abiToUse: any[] = TwitchCardVaultABI; // Default
     const contractAddressLower = contractAddress.toLowerCase();
 
+    if (!useCallData) {
+
     // ZkSend / DirectSend: select ABI by contract address (docs/smart-action-zksend-abi.md)
     const zkSendAddress = (Deno.env.get('ZKSEND_CONTRACT_ADDRESS') || Deno.env.get('VITE_ARC_ZKSEND_CONTRACT_ADDRESS') || '').trim().toLowerCase();
     const directSendAddress = (Deno.env.get('DIRECT_SEND_CONTRACT_ADDRESS') || Deno.env.get('VITE_ARC_DIRECT_SEND_CONTRACT_ADDRESS') || '').trim().toLowerCase();
@@ -6858,7 +7165,11 @@ app.post('/wallets/send-transaction', async (c) => {
     
     // Card creation functions are in the main GiftCard contract, not in Vault contracts
     const isCreateFunction = functionName.startsWith('createGiftCard');
-    const isErc20Approve = functionName === 'approve';
+    const isErc20Allowance = ERC20_ALLOWANCE_FUNCTION_NAMES.has(functionName);
+    const isCircleBridgeKit =
+      CIRCLE_BRIDGE_KIT_FUNCTION_NAMES.has(functionName) ||
+      contractAddressLower === CIRCLE_BRIDGE_KIT_CONTRACT_LOWER;
+    const isCctpV2Bridge = CCTP_V2_FUNCTION_NAMES.has(functionName);
     // Main GiftCard contract addresses
     const mainContractAddresses: string[] = [
       Deno.env.get('VITE_ARC_CONTRACT_ADDRESS'),
@@ -6868,9 +7179,12 @@ app.post('/wallets/send-transaction', async (c) => {
     ].filter((addr): addr is string => Boolean(addr)).map(addr => addr.toLowerCase());
     const isMainContract = mainContractAddresses.some(addr => contractAddressLower === addr);
     
-    if (isErc20Approve) {
-      // Use the minimal ERC20 ABI for approve
-      abiToUse = ERC20_MIN_ABI;
+    if (isErc20Allowance) {
+      abiToUse = ERC20_ALLOWANCE_ABI;
+    } else if (isCircleBridgeKit) {
+      abiToUse = CIRCLE_BRIDGE_KIT_ABI;
+    } else if (isCctpV2Bridge) {
+      abiToUse = CCTP_V2_BRIDGE_ABI;
     } else if (isCreateFunction || isMainContract) {
       // Use the main contract ABI for card creation functions
       abiToUse = GiftCardABI;
@@ -6888,58 +7202,71 @@ app.post('/wallets/send-transaction', async (c) => {
       }
     }
     }
-    
-    // Prepare the transaction for the Circle API
-    const functionSignature = getFunctionSignature(functionName, abiToUse);
-    
-    // Transform args for the Circle API
-    // Args can be: BigInt, string (numbers), string (addresses)
-    const formattedArgs = args.map((arg: any) => {
-      // Convert BigInt to string
-      if (typeof arg === 'bigint') {
-        return arg.toString();
-      }
-      // If it is a numeric string (e.g., tokenId) - keep as string
-      if (typeof arg === 'string') {
-        // Address - keep as is
-        if (arg.startsWith('0x')) {
-          return arg;
-        }
-        // Numeric string - keep as is (Circle API accepts strings for big integers)
-        // Check if it is numeric
-        if (!isNaN(Number(arg)) && arg.trim() !== '') {
-          return arg; // Keep as string for big integers
-        }
-        // Regular string (e.g., username) - keep as is
-        return arg;
-      }
-      // Number - convert to string for large values
-      if (typeof arg === 'number') {
-        return arg.toString();
-      }
-      return arg;
-    });
+    }
 
-    // Circle API expects a flat fee field (not nested)
-    // As per REST API docs, feeLevel must be on the top-level request body
-    // https://developers.circle.com/api-reference/w3s/developer-controlled-wallets/create-contract-execution-transaction
-    const transactionData = {
+    let resolvedCallData: string | null =
+      typeof callDataRaw === 'string' && callDataRaw.startsWith('0x') ? callDataRaw : null;
+
+    if (
+      !resolvedCallData &&
+      functionName &&
+      ZKSEND_CLAIM_FUNCTION_NAMES.has(functionName) &&
+      Array.isArray(args)
+    ) {
+      const zkSendAddress = getZkSendContractAddressLower();
+      if (zkSendAddress && contractAddressLower === zkSendAddress) {
+        const encoded = encodeZkSendClaimCallData(functionName, args);
+        if (!encoded.ok) {
+          console.error('[send-transaction] ZkSend claim encode failed:', encoded.error);
+          return c.json({
+            success: false,
+            error: 'Failed to encode claim calldata',
+            details: encoded.error,
+            code: 'CLAIM_ENCODE_FAILED',
+          }, 400);
+        }
+        resolvedCallData = encoded.callData;
+        console.log('[send-transaction] ZkSend claim encoded to callData', {
+          functionName,
+          mode: 'callData',
+          encodeReason: 'zksend_claim_tuple',
+          callDataPreview: `${resolvedCallData.slice(0, 18)}...`,
+        });
+      }
+    }
+
+    const useCallDataFinal =
+      typeof resolvedCallData === 'string' && resolvedCallData.startsWith('0x');
+
+    const transactionDataBase = {
       walletId: walletId as string,
       contractAddress: contractAddress as string,
-      abiFunctionSignature: functionSignature as string,
-      abiParameters: formattedArgs,
       feeLevel: 'MEDIUM' as const,
       entitySecretCiphertext: entitySecretCiphertextForRequest,
-      idempotencyKey: crypto.randomUUID()
+      idempotencyKey: crypto.randomUUID(),
     };
+
+    const transactionData = useCallDataFinal
+      ? {
+          ...transactionDataBase,
+          callData: resolvedCallData as string,
+        }
+      : {
+          ...transactionDataBase,
+          abiFunctionSignature: getFunctionSignature(functionName as string, abiToUse) as string,
+          abiParameters: (args as any[]).map((arg: any) => serializeCircleAbiArg(arg)),
+        };
 
     console.log('Sending transaction to Circle API:', {
       walletId: transactionData.walletId,
       contractAddress: transactionData.contractAddress,
-      abiFunctionSignature: transactionData.abiFunctionSignature,
-      abiParameters: transactionData.abiParameters,
+      mode: useCallDataFinal ? 'callData' : 'abi',
+      abiFunctionSignature: 'abiFunctionSignature' in transactionData ? transactionData.abiFunctionSignature : undefined,
+      abiParameters: 'abiParameters' in transactionData ? transactionData.abiParameters : undefined,
+      callDataPreview: useCallDataFinal ? `${(resolvedCallData as string).slice(0, 18)}...` : undefined,
       feeLevel: transactionData.feeLevel,
-      blockchain: blockchain
+      blockchain: blockchain,
+      functionName: functionName ?? rawFunctionName,
     });
 
     // Optional wallet check in Circle (may not work if the wallet belongs to a different entity)
@@ -6972,18 +7299,18 @@ app.post('/wallets/send-transaction', async (c) => {
         }
       } else {
         // Wallet not found in Circle; this can be normal if it belongs to a different entity.
-        // Continue and attempt to send the transaction — Circle will error if the wallet is not owned by the entity.
+        // Continue and attempt to send the transaction - Circle will error if the wallet is not owned by the entity.
         const errorText = await walletCheckResponse.text();
         console.warn('Wallet check returned non-OK status (this may be normal if wallet belongs to different entity):', {
           status: walletCheckResponse.status,
           statusText: walletCheckResponse.statusText,
           error: errorText,
           walletId: walletId,
-          note: 'Will attempt to send the transaction anyway — Circle API will return an error if wallet does not belong to the entity'
+          note: 'Will attempt to send the transaction anyway - Circle API will return an error if wallet does not belong to the entity'
         });
       }
     } catch (walletCheckError) {
-      // Error during wallet check — continue and attempt to send the transaction
+      // Error during wallet check - continue and attempt to send the transaction
       console.warn('Error checking wallet in Circle (will attempt the transaction anyway):', walletCheckError);
     }
 
@@ -6997,8 +7324,10 @@ app.post('/wallets/send-transaction', async (c) => {
       walletId: transactionData.walletId,
       walletAddress: walletAddress,
       contractAddress: transactionData.contractAddress,
-      abiFunctionSignature: transactionData.abiFunctionSignature,
-      abiParameters: transactionData.abiParameters,
+      mode: useCallDataFinal ? 'callData' : 'abi',
+      abiFunctionSignature: 'abiFunctionSignature' in transactionData ? transactionData.abiFunctionSignature : undefined,
+      abiParameters: 'abiParameters' in transactionData ? transactionData.abiParameters : undefined,
+      callDataPreview: useCallDataFinal ? `${(resolvedCallData as string).slice(0, 18)}...` : undefined,
       feeLevel: transactionData.feeLevel,
       entitySecretCiphertext: transactionData.entitySecretCiphertext ? `${transactionData.entitySecretCiphertext.substring(0, 20)}...` : 'MISSING',
       blockchain: blockchain,
@@ -7046,9 +7375,8 @@ app.post('/wallets/send-transaction', async (c) => {
         requestData: {
           walletId: transactionData.walletId,
           contractAddress: transactionData.contractAddress,
-          abiFunctionSignature: transactionData.abiFunctionSignature,
-          abiParameters: transactionData.abiParameters,
-          feeLevel: transactionData.feeLevel
+          mode: useCallDataFinal ? 'callData' : 'abi',
+          feeLevel: transactionData.feeLevel,
         }
       };
 
@@ -7086,26 +7414,21 @@ app.post('/wallets/send-transaction', async (c) => {
     
     // Circle API returns a transaction id and state; txHash may be located elsewhere
     const transactionId: string | undefined = result.data?.id;
-    const transactionState: string | undefined = result.data?.state;
-    const txHash: string | undefined = result.data?.transaction?.hash || result.data?.hash;
+    let transactionState: string | undefined = result.data?.state;
+    let txHash: string | undefined = result.data?.transaction?.hash || result.data?.hash;
 
     if (!transactionId) {
       console.error('No transaction ID in response:', result);
       throw new Error('Failed to get transaction ID from Circle API');
     }
 
-    // If txHash is not present yet (state INITIATED or QUEUED), that's expected.
-    // The client should poll for transaction status later.
-    if (!txHash && transactionState !== 'INITIATED' && transactionState !== 'QUEUED') {
-      console.warn('Transaction created but no hash yet. State:', transactionState);
-    }
-
+    // Client polls `/wallets/transaction-status` - avoid blocking Edge on Circle confirmation.
     return c.json({
       success: true,
       txHash: txHash || undefined,
       transactionId: transactionId,
       transactionState: transactionState,
-      transaction: result.data
+      transaction: result.data,
     });
   } catch (error) {
     console.error('Error sending transaction:', error);
@@ -9034,7 +9357,7 @@ async function getCircleAuth(): Promise<CircleAuthResult> {
     return {
       ok: false,
       error:
-        'Missing CIRCLE_API_KEY or CIRCLE_ENTITY_SECRET — add them as secrets for this Edge function (Dashboard → Edge Functions → Secrets), not only in the SPA .env',
+        'Missing CIRCLE_API_KEY or CIRCLE_ENTITY_SECRET - add them as secrets for this Edge function (Dashboard → Edge Functions → Secrets), not only in the SPA .env',
     };
   }
 

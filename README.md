@@ -1,6 +1,6 @@
 # sendly-supabase
 
-Supabase backend for Sendly — NFT Gift Cards, zkTLS payments, leaderboard, and infrastructure.
+Supabase backend for Sendly - NFT Gift Cards, zkTLS payments, leaderboard, and infrastructure.
 
 ## Project Structure
 

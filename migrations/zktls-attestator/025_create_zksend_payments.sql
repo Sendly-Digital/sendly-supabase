@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS zksend_payments (
   sender_address TEXT NOT NULL,
   recipient_identity_hash TEXT NOT NULL,  -- Hash of social identity (platform:username)
   social_platform TEXT NOT NULL,  -- twitter, telegram, instagram, tiktok, twitch
+  recipient_username TEXT,  -- normalized: lowercase, trim, leading @ stripped only
+  recipient_username_raw TEXT,  -- as received from user (optional)
   amount TEXT NOT NULL,  -- BigInt as string
   currency TEXT NOT NULL,  -- USDC, EURC
   recipient_wallet TEXT,  -- NULL until claimed
@@ -17,6 +19,10 @@ CREATE TABLE IF NOT EXISTS zksend_payments (
   -- Indexes for efficient queries
   CONSTRAINT zksend_payments_payment_id_key UNIQUE (payment_id)
 );
+
+-- Add username columns if table already existed (idempotent for existing DBs)
+ALTER TABLE zksend_payments ADD COLUMN IF NOT EXISTS recipient_username TEXT;
+ALTER TABLE zksend_payments ADD COLUMN IF NOT EXISTS recipient_username_raw TEXT;
 
 -- Index for querying by identity hash
 CREATE INDEX IF NOT EXISTS idx_zksend_recipient_identity 
@@ -56,6 +62,8 @@ SELECT
   sender_address,
   recipient_identity_hash,
   social_platform,
+  recipient_username,
+  recipient_username_raw,
   amount,
   currency,
   created_at,

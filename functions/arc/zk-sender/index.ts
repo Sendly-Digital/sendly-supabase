@@ -343,7 +343,7 @@ function getDirectSendContractAddress(): string | null {
 
 /**
  * Returns the ABI for a contract by its address (ZkSend or DirectSend).
- * If contractAddress does not match any known contract — null.
+ * If contractAddress does not match any known contract - null.
  */
 function getAbiForContractAddress(contractAddress: string): typeof ZKSEND_ABI | typeof DIRECT_SEND_ABI | null {
   const addr = normalizeContractAddress(contractAddress);
@@ -978,7 +978,7 @@ app.get('/telegram/user', async (c) => {
 });
 
 /**
- * POST /proof/prepare-claim — social-handle orchestration:
+ * POST /proof/prepare-claim - social-handle orchestration:
  * validates inputs, performs zkTLS proof generate/verify, and builds claim package for claimPayment.
  */
 app.post('/proof/prepare-claim', async (c) => {
@@ -1111,7 +1111,7 @@ app.post('/proof/prepare-claim', async (c) => {
 });
 
 /**
- * POST /direct-send/prepare — short-path for wallet-to-wallet transfer without social proof.
+ * POST /direct-send/prepare - short-path for wallet-to-wallet transfer without social proof.
  */
 app.post('/direct-send/prepare', async (c) => {
   const correlationId = crypto.randomUUID();
@@ -1172,7 +1172,7 @@ app.post('/direct-send/prepare', async (c) => {
 });
 
 /**
- * POST /wallets/send-transaction — encodes a ZkSend/DirectSend contract call (see docs/smart-action-zksend-abi.md).
+ * POST /wallets/send-transaction - encodes a ZkSend/DirectSend contract call (see docs/smart-action-zksend-abi.md).
  * Based on contractAddress, the ZkSend or DirectSend ABI is substituted, and calldata is built via viem.
  * Returns encodedData; the actual network submission (Circle API) should be performed by the caller or smart-action.
  */
