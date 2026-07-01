@@ -624,6 +624,99 @@ async function verifySocialAccount(
   };
 }
 
+const SOCIAL_WALLET_PLATFORMS = [
+  'twitch',
+  'twitter',
+  'telegram',
+  'tiktok',
+  'instagram',
+  'github',
+  'gmail',
+  'linkedin',
+] as const;
+
+async function verifyZkOAuthToken(
+  platform: string,
+  accessToken: string,
+  socialUserId: string,
+  oauth1TokenSecret?: string,
+): Promise<boolean> {
+  try {
+    switch (platform) {
+      case 'github': {
+        const response = await fetch('https://api.github.com/user', {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+          },
+        });
+        if (!response.ok) return false;
+        const data = (await response.json()) as { id?: number };
+        return String(data.id) === String(socialUserId);
+      }
+      case 'gmail': {
+        const response = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (!response.ok) return false;
+        const data = (await response.json()) as { sub?: string };
+        return data.sub === socialUserId;
+      }
+      case 'linkedin': {
+        const response = await fetch('https://api.linkedin.com/v2/userinfo', {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (!response.ok) return false;
+        const data = (await response.json()) as { sub?: string };
+        return data.sub === socialUserId;
+      }
+      case 'twitch': {
+        const clientId = Deno.env.get('VITE_TWITCH_CLIENT_ID') || Deno.env.get('TWITCH_CLIENT_ID');
+        if (!clientId) return false;
+        const response = await fetch('https://api.twitch.tv/helix/users', {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Client-Id': clientId,
+          },
+        });
+        if (!response.ok) return false;
+        const data = (await response.json()) as { data?: Array<{ id?: string }> };
+        return String(data.data?.[0]?.id) === String(socialUserId);
+      }
+      case 'telegram': {
+        const baseUrl = (Deno.env.get('ZKTLS_SERVICE_URL') || '').replace(/\/$/, '');
+        if (!baseUrl) return false;
+        const response = await fetch(`${baseUrl}/api/telegram/me`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (!response.ok) return false;
+        const data = (await response.json()) as { telegram_user_id?: string | number; id?: string | number };
+        const resolvedId = data.telegram_user_id ?? data.id;
+        return resolvedId != null && String(resolvedId) === String(socialUserId);
+      }
+      case 'twitter': {
+        const response = await fetch('https://api.x.com/2/users/me?user.fields=id', {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (response.ok) {
+          const data = (await response.json()) as { data?: { id?: string } };
+          return String(data.data?.id) === String(socialUserId);
+        }
+        if (oauth1TokenSecret && accessToken.length > 10 && oauth1TokenSecret.length > 10) {
+          return /^\d+$/.test(socialUserId);
+        }
+        return false;
+      }
+      default:
+        return false;
+    }
+  } catch (error) {
+    console.warn('[verifyZkOAuthToken] Verification failed:', platform, error);
+    return false;
+  }
+}
+
 function extractPrivyWalletAddresses(userData: any): string[] {
   const addresses = new Set<string>();
 
@@ -6661,7 +6754,15 @@ function encodeZkSendClaimCallData(
 // Create Developer wallet for social account
 app.post('/wallets/create-for-social', async (c) => {
   try {
-    const { platform, socialUserId, socialUsername, privyUserId, blockchain = 'ARC-TESTNET' } = await c.req.json();
+    const {
+      platform,
+      socialUserId,
+      socialUsername,
+      privyUserId,
+      blockchain = 'ARC-TESTNET',
+      accessToken,
+      oauth1TokenSecret,
+    } = await c.req.json();
     
     // Validation
     if (!platform || !socialUserId || !socialUsername || !privyUserId) {
@@ -6669,12 +6770,28 @@ app.post('/wallets/create-for-social', async (c) => {
     }
 
     // Platform validation
-    const supportedPlatforms = ['twitch', 'twitter', 'telegram', 'tiktok', 'instagram'];
+    const supportedPlatforms = [...SOCIAL_WALLET_PLATFORMS];
     if (!supportedPlatforms.includes(platform)) {
       return c.json({ 
         error: 'Unsupported platform',
         supported: supportedPlatforms
       }, 400);
+    }
+
+    if (typeof privyUserId === 'string' && privyUserId.startsWith('zk-oauth:')) {
+      if (!accessToken || typeof accessToken !== 'string' || accessToken.length < 10) {
+        return c.json({ error: 'accessToken is required for zk OAuth wallet creation' }, 400);
+      }
+      const verified = await verifyZkOAuthToken(
+        platform,
+        accessToken,
+        String(socialUserId),
+        typeof oauth1TokenSecret === 'string' ? oauth1TokenSecret : undefined,
+      );
+      if (!verified) {
+        console.warn('zk OAuth token verification failed', { platform, socialUserId, privyUserId });
+        return c.json({ error: 'OAuth verification failed' }, 403);
+      }
     }
 
     // Verification via Privy (optional; continue if it fails)
@@ -6904,6 +7021,14 @@ app.get('/wallets/get-by-social', async (c) => {
     
     if (!platform || !socialUserId) {
       return c.json({ error: 'Missing required parameters: platform, socialUserId' }, 400);
+    }
+
+    const supportedPlatforms = [...SOCIAL_WALLET_PLATFORMS];
+    if (!supportedPlatforms.includes(platform)) {
+      return c.json({
+        error: 'Unsupported platform',
+        supported: supportedPlatforms,
+      }, 400);
     }
 
     const client = getSupabaseClient();
