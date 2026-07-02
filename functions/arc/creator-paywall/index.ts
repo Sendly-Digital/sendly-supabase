@@ -549,9 +549,82 @@ app.get('/', (c) =>
       'PATCH /creator/profile',
       'GET /openapi.json',
       'GET /llms.txt',
+      'GET /lepton-hackathon',
     ],
   }),
 );
+
+function getPublicBase(): string {
+  return Deno.env.get('PUBLIC_CREATOR_PAYWALL_URL')?.trim() || '/functions/v1/creator-paywall';
+}
+
+function buildSettlement() {
+  return {
+    chainId: getArcChainId(),
+    contractAddress: getZkSendContractAddress(),
+    usdcAddress: getArcUsdcAddress(),
+    method: 'ZkSend.createPayment',
+    platformSource: 'Read per-paywall from the 402 response: paywall.recipient.platform',
+    supportedPlatforms: ['twitter', 'github', 'twitch', 'gmail', 'linkedin', 'telegram'],
+    minPriceUsdc: String(MIN_PRICE_USDC),
+  };
+}
+
+function buildAgentResources(base: string) {
+  return [
+    {
+      type: 'llms',
+      url: `${base}/llms.txt`,
+      method: 'GET',
+      description: 'Plain-text unlock flow for AI agents (HTTP 402 → pay on Arc → retry with headers).',
+    },
+    {
+      type: 'openapi',
+      url: `${base}/openapi.json`,
+      method: 'GET',
+      description: 'OpenAPI 3.1.0 spec with x-settlement (Arc chainId, ZkSend contract, USDC).',
+    },
+    {
+      type: 'paywall',
+      url: `${base}/paywall/{slug}`,
+      method: 'GET',
+      description:
+        'Access paid content. Returns HTTP 402 with payment instructions when locked; HTTP 200 with content_body once paid (send X-Sendly-Payment-Id, X-Sendly-Tx-Hash, X-Sendly-Source headers).',
+    },
+    {
+      type: 'creator-profile',
+      url: `${base}/creator/{platform}/{handle}`,
+      method: 'GET',
+      description: 'Public creator profile with active article metadata (no content_body).',
+    },
+  ];
+}
+
+app.get('/lepton-hackathon', (c) => {
+  const base = getPublicBase();
+  const demoSlug = Deno.env.get('LEPTON_DEMO_SLUG')?.trim();
+
+  const body: Record<string, unknown> = {
+    service: 'sendly-creator-paywall',
+    description:
+      'Social identity routing layer for agent & creator nanopayments on Arc. x402 usually pays an endpoint/wallet — Sendly pays a social identity (github:<handle>).',
+    hackathon: 'lepton',
+    auth: 'All endpoints require an Authorization: Bearer <supabase anon key> header.',
+    resources: buildAgentResources(base),
+    settlement: buildSettlement(),
+  };
+
+  if (demoSlug) {
+    body.example = {
+      slug: demoSlug,
+      url: `${base}/paywall/${demoSlug}`,
+      method: 'GET',
+      description: 'Existing demo paywall — GET returns HTTP 402 with payment instructions.',
+    };
+  }
+
+  return c.json(body);
+});
 
 app.get('/openapi.json', (c) => {
   const chainId = getArcChainId();
@@ -562,7 +635,7 @@ app.get('/openapi.json', (c) => {
       title: 'Sendly Creator Paywall',
       version: '1.0.0',
       description:
-        'HTTP 402 paywall with Arc USDC settlement via ZkSend to github social identity. No Tempo/pathUSD.',
+        'HTTP 402 paywall with Arc USDC settlement via ZkSend to a social identity (twitter, github, twitch, gmail, linkedin, telegram). Read the target platform/handle from the 402 response (paywall.recipient).',
     },
     paths: {
       '/paywall/{slug}': {
@@ -619,7 +692,8 @@ app.get('/openapi.json', (c) => {
       contractAddress,
       usdcAddress: getArcUsdcAddress(),
       method: 'ZkSend.createPayment',
-      platform: PLATFORM_MVP,
+      platformSource: 'Read per-paywall from the 402 response: paywall.recipient.platform',
+      supportedPlatforms: ['twitter', 'github', 'twitch', 'gmail', 'linkedin', 'telegram'],
     },
   });
 });
@@ -628,13 +702,14 @@ app.get('/llms.txt', (c) => {
   const base = Deno.env.get('PUBLIC_CREATOR_PAYWALL_URL')?.trim() || '/functions/v1/creator-paywall';
   const text = `# Sendly Creator Paywall (Arc USDC / ZkSend)
 
-Settlement: ZkSend.createPayment on Arc Testnet USDC to github:<handle>.
-Do NOT use Tempo, pathUSD, or mpp-gateway.
+Settlement: ZkSend.createPayment on Arc Testnet USDC to a social identity <platform>:<handle>.
+The platform is NOT always github — read it from the 402 response (paywall.recipient.platform).
 
 ## Unlock flow
 1. GET ${base}/paywall/{slug}
-2. If HTTP 402, read JSON paywall instructions (identityHash, priceUsdc, contractAddress).
-3. On Arc: approve USDC then ZkSend.createPayment(identityHash, "github", amountWei, usdc).
+2. If HTTP 402, read JSON paywall instructions (identityHash, priceUsdc, contractAddress, recipient.platform, recipient.handle).
+3. On Arc: approve USDC then ZkSend.createPayment(identityHash, recipient.platform, amountWei, usdc).
+   Use the exact platform from the 402 response (e.g. "twitter" or "github") — a wrong platform will not match identityHash.
    Agent option: circle wallet execute --chain ARC-TESTNET (see Circle Agent Stack docs).
 4. POST payment index to /zk-sender/payments (optional but recommended).
 5. Retry GET with headers:
