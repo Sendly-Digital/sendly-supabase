@@ -54,5 +54,5 @@ WHERE p.platform = 'github' AND p.handle IS NOT NULL
 ON CONFLICT (platform, handle) DO NOTHING;
 
 COMMENT ON TABLE creator_profiles IS 'Creator profile entity keyed by (platform, handle); Phase 1 of creator storage/profiles';
-COMMENT ON COLUMN creator_profiles.identity_hash IS 'keccak256("platform:handle") — same hash used for ZkSend settlement';
+COMMENT ON COLUMN creator_profiles.identity_hash IS 'keccak256("platform:handle") - same hash used for ZkSend settlement';
 COMMENT ON COLUMN creator_profiles.owner_github_user_id IS 'Set for github profiles verified via OAuth token; null for attested non-github profiles';

@@ -9,11 +9,26 @@ import {
   toBytes,
   type Address,
 } from 'npm:viem';
+import { verifyGithubWebhookSignature } from './githubWebhook.ts';
+import {
+  listPolicies,
+  listReceipts,
+  processMergedPullRequestWebhook,
+  syncClaimStatuses,
+  upsertPolicy,
+  type GithubPullRequestPayload,
+  type PrPayoutDeps,
+} from './prPayout.ts';
+import {
+  listCitationSources,
+  registerCitationSourceFromBody,
+} from './citationSources.ts';
+import { runCitationDemo, seedCitationSourcesFromPaywalls } from './citationRunner.ts';
 
 const corsHeaders: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers':
-    'authorization, x-client-info, apikey, content-type, x-sendly-payment-id, x-sendly-tx-hash, x-sendly-source, x-sendly-github-token, x-sendly-oauth-platform, x-sendly-oauth-token, x-sendly-oauth-username',
+    'authorization, x-client-info, apikey, content-type, x-sendly-payment-id, x-sendly-tx-hash, x-sendly-source, x-sendly-github-token, x-sendly-oauth-platform, x-sendly-oauth-token, x-sendly-oauth-username, x-hub-signature-256, x-github-event',
   'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, PUT, PATCH, DELETE',
   'Access-Control-Max-Age': '86400',
 };
@@ -39,6 +54,8 @@ app.use(
       'X-Sendly-Oauth-Platform',
       'X-Sendly-Oauth-Token',
       'X-Sendly-Oauth-Username',
+      'X-Hub-Signature-256',
+      'X-GitHub-Event',
     ],
     allowMethods: ['POST', 'GET', 'OPTIONS', 'PUT', 'DELETE', 'PATCH'],
     credentials: false,
@@ -137,6 +154,19 @@ function generateIdentityHash(platform: string, username: string): `0x${string}`
 
 function parseUsdcToWei(priceUsdc: number): bigint {
   return BigInt(Math.round(priceUsdc * 1_000_000));
+}
+
+function getPrPayoutDeps(): PrPayoutDeps {
+  return {
+    getClient: getSupabaseClient,
+    getArcConfig: () => ({
+      chainId: getArcChainId(),
+      usdcAddress: getArcUsdcAddress(),
+      zkSendAddress: getZkSendContractAddress() ?? '',
+      rpcUrl: getArcRpcUrl(),
+    }),
+    generateIdentityHash,
+  };
 }
 
 function extractSlugFromPath(path: string): string {
@@ -550,6 +580,14 @@ app.get('/', (c) =>
       'GET /openapi.json',
       'GET /llms.txt',
       'GET /lepton-hackathon',
+      'POST /webhooks/github',
+      'GET /pr-payouts',
+      'GET /pr-payout-policy',
+      'POST /pr-payout-policy',
+      'GET /citation/sources',
+      'POST /citation/sources',
+      'POST /citation/demo-run',
+      'POST /citation/seed-from-paywalls',
     ],
   }),
 );
@@ -597,6 +635,32 @@ function buildAgentResources(base: string) {
       method: 'GET',
       description: 'Public creator profile with active article metadata (no content_body).',
     },
+    {
+      type: 'github-pr-webhook',
+      url: `${base}/webhooks/github`,
+      method: 'POST',
+      description:
+        'GitHub webhook: merged PR → policy-controlled flat USDC payout to github:author from sponsor pool (X-Hub-Signature-256 required).',
+    },
+    {
+      type: 'pr-payouts',
+      url: `${base}/pr-payouts`,
+      method: 'GET',
+      description: 'Public payout receipts (repo, PR#, author, amount, tx_hash, claim_status).',
+    },
+    {
+      type: 'citation-sources',
+      url: `${base}/citation/sources`,
+      method: 'GET',
+      description: 'Registered citation sources (paywall slug or external URL) for agent grounding.',
+    },
+    {
+      type: 'citation-demo',
+      url: `${base}/citation/demo-run`,
+      method: 'POST',
+      description:
+        'Demo research agent: pays for registered paywall slugs via real ZkSend.createPayment (sponsor pool), returns answer with citations.',
+    },
   ];
 }
 
@@ -607,9 +671,10 @@ app.get('/lepton-hackathon', (c) => {
   const body: Record<string, unknown> = {
     service: 'sendly-creator-paywall',
     description:
-      'Social identity routing layer for agent & creator nanopayments on Arc. x402 usually pays an endpoint/wallet — Sendly pays a social identity (github:<handle>).',
+      'Social identity settlement for open-source work: autonomous PR payouts to github:handle and citation tolls via HTTP 402. Hero: merged PR → sponsor pool pays contributor (no wallet upfront).',
     hackathon: 'lepton',
-    auth: 'All endpoints require an Authorization: Bearer <supabase anon key> header.',
+    hero: 'github-pr-payout-agent',
+    auth: 'Most GET endpoints accept optional Authorization: Bearer <supabase anon key>. GitHub webhooks use X-Hub-Signature-256 only.',
     resources: buildAgentResources(base),
     settlement: buildSettlement(),
   };
@@ -619,7 +684,7 @@ app.get('/lepton-hackathon', (c) => {
       slug: demoSlug,
       url: `${base}/paywall/${demoSlug}`,
       method: 'GET',
-      description: 'Existing demo paywall — GET returns HTTP 402 with payment instructions.',
+      description: 'Existing demo paywall - GET returns HTTP 402 with payment instructions.',
     };
   }
 
@@ -649,7 +714,7 @@ app.get('/openapi.json', (c) => {
           ],
           responses: {
             '200': { description: 'Unlocked content' },
-            '402': { description: 'Payment required — pay via ZkSend.createPayment on Arc' },
+            '402': { description: 'Payment required - pay via ZkSend.createPayment on Arc' },
           },
         },
       },
@@ -686,6 +751,31 @@ app.get('/openapi.json', (c) => {
         post: { summary: 'Idempotent upsert of creator profile (GitHub verified, others attested)' },
         patch: { summary: 'Update creator profile display_name/bio/avatar_url (owner only)' },
       },
+      '/webhooks/github': {
+        post: {
+          summary: 'GitHub webhook - merged PR triggers flat USDC payout to github:author',
+          description: 'Requires X-Hub-Signature-256 (HMAC-SHA256). Processes pull_request closed+merged only.',
+        },
+      },
+      '/pr-payouts': {
+        get: {
+          summary: 'List PR payout receipts',
+          responses: { '200': { description: 'Payout events with tx_hash and claim_status' } },
+        },
+      },
+      '/pr-payout-policy': {
+        get: { summary: 'List repo payout policies (sponsor pool, per-PR amount, caps)' },
+        post: { summary: 'Upsert payout policy for a demo repo' },
+      },
+      '/citation/sources': {
+        get: { summary: 'List active citation sources (slug or external URL)' },
+        post: { summary: 'Register citation source' },
+      },
+      '/citation/demo-run': {
+        post: {
+          summary: 'Run demo research agent - real 402-style payments for registered paywall slugs',
+        },
+      },
     },
     'x-settlement': {
       chainId,
@@ -703,13 +793,13 @@ app.get('/llms.txt', (c) => {
   const text = `# Sendly Creator Paywall (Arc USDC / ZkSend)
 
 Settlement: ZkSend.createPayment on Arc Testnet USDC to a social identity <platform>:<handle>.
-The platform is NOT always github — read it from the 402 response (paywall.recipient.platform).
+The platform is NOT always github - read it from the 402 response (paywall.recipient.platform).
 
-## Unlock flow
+## Unlock flow (paywall / citation)
 1. GET ${base}/paywall/{slug}
 2. If HTTP 402, read JSON paywall instructions (identityHash, priceUsdc, contractAddress, recipient.platform, recipient.handle).
 3. On Arc: approve USDC then ZkSend.createPayment(identityHash, recipient.platform, amountWei, usdc).
-   Use the exact platform from the 402 response (e.g. "twitter" or "github") — a wrong platform will not match identityHash.
+   Use the exact platform from the 402 response (e.g. "twitter" or "github") - a wrong platform will not match identityHash.
    Agent option: circle wallet execute --chain ARC-TESTNET (see Circle Agent Stack docs).
 4. POST payment index to /zk-sender/payments (optional but recommended).
 5. Retry GET with headers:
@@ -717,6 +807,18 @@ The platform is NOT always github — read it from the 402 response (paywall.rec
    - X-Sendly-Tx-Hash: <txHash>
    - X-Sendly-Source: agent|human
 6. HTTP 200 returns content_body.
+
+## PR Payout Agent (hero - Lepton)
+1. Maintainer configures policy: POST ${base}/pr-payout-policy (repo_id, per_pr_amount_usdc, caps).
+2. GitHub webhook: POST ${base}/webhooks/github (pull_request closed + merged=true).
+3. Agent checks policy, anti-abuse (bots, self-merge, budget), pays github:author from sponsor pool via ZkSend.
+4. Receipts: GET ${base}/pr-payouts (tx_hash, claim_status).
+5. Contributor claims via existing Sendly zkTLS GitHub ownership - no wallet required upfront.
+
+## Citation via 402
+1. Register sources: GET/POST ${base}/citation/sources (slug = existing paywall, or external url for registry).
+2. Demo agent: POST ${base}/citation/demo-run { "question": "..." } - pays each slug via real Arc tx, returns cited answer.
+3. Same settlement as paywall unlock - attribution becomes settlement.
 
 Browse a creator's articles: GET ${base}/creator/{platform}/{handle} (metadata only, no content_body).
 Min price: ${MIN_PRICE_USDC} USDC.
@@ -1154,6 +1256,179 @@ app.patch('/creator/profile', async (c) => {
   } catch (err) {
     console.error('[creator-paywall] PATCH profile error:', err);
     return c.json({ error: err instanceof Error ? err.message : 'Internal error' }, 500);
+  }
+});
+
+app.post('/webhooks/github', async (c) => {
+  try {
+    const secret = Deno.env.get('GITHUB_WEBHOOK_SECRET')?.trim();
+    if (!secret) {
+      return c.json({ error: 'GITHUB_WEBHOOK_SECRET not configured' }, 500);
+    }
+
+    const rawBody = await c.req.text();
+    const signature = c.req.header('X-Hub-Signature-256');
+    const event = c.req.header('X-GitHub-Event') ?? '';
+
+    if (!(await verifyGithubWebhookSignature(rawBody, signature, secret))) {
+      return c.json({ error: 'invalid signature' }, 401);
+    }
+
+    if (event === 'ping') {
+      return c.json({ ok: true, pong: true });
+    }
+
+    const payload = JSON.parse(rawBody) as GithubPullRequestPayload;
+    const result = await processMergedPullRequestWebhook(getPrPayoutDeps(), payload);
+    return c.json({ ok: true, event, ...result });
+  } catch (err) {
+    console.error('[creator-paywall] github webhook error:', err);
+    return c.json({ error: err instanceof Error ? err.message : 'Internal error' }, 500);
+  }
+});
+
+app.get('/pr-payouts', async (c) => {
+  try {
+    await syncClaimStatuses(getPrPayoutDeps());
+    const receipts = await listReceipts(getSupabaseClient());
+    return c.json({
+      receipts: receipts.map((r) => ({
+        repo: r.repo_full_name,
+        prNumber: r.pr_number,
+        author: r.author_login,
+        amount: r.amount_usdc,
+        status: r.status,
+        paymentId: r.payment_id,
+        txHash: r.tx_hash,
+        claimStatus: r.claim_status,
+        skipReason: r.skip_reason,
+        createdAt: r.created_at,
+      })),
+    });
+  } catch (err) {
+    console.error('[creator-paywall] pr-payouts error:', err);
+    return c.json({ error: err instanceof Error ? err.message : 'Internal error' }, 500);
+  }
+});
+
+app.get('/pr-payout-policy', async (c) => {
+  try {
+    const policies = await listPolicies(getSupabaseClient());
+    return c.json({
+      policies: policies.map((p) => ({
+        repoId: p.repo_id,
+        repoFullName: p.repo_full_name,
+        sponsorPoolRef: p.sponsor_pool_ref,
+        perPrAmountUsdc: p.per_pr_amount_usdc,
+        dailyCapUsdc: p.daily_cap_usdc,
+        budgetRemainingUsdc: p.budget_remaining_usdc,
+        active: p.active,
+      })),
+      spendingPolicyNote:
+        'Circle Agent Wallet spending policy (per-tx / daily cap) is a second guardrail alongside DB policy.',
+    });
+  } catch (err) {
+    console.error('[creator-paywall] pr-payout-policy GET error:', err);
+    return c.json({ error: err instanceof Error ? err.message : 'Internal error' }, 500);
+  }
+});
+
+app.post('/pr-payout-policy', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const repoId = typeof body.repoId === 'number' ? body.repoId : parseInt(String(body.repoId ?? ''), 10);
+    const repoFullName = typeof body.repoFullName === 'string' ? body.repoFullName.trim() : '';
+    const perPrAmountUsdc = parsePriceUsdc(body.perPrAmountUsdc ?? body.per_pr_amount_usdc);
+    const dailyCapUsdc = parsePriceUsdc(body.dailyCapUsdc ?? body.daily_cap_usdc) ?? 50;
+    const budgetRemainingUsdc = parsePriceUsdc(body.budgetRemainingUsdc ?? body.budget_remaining_usdc) ?? 100;
+
+    if (!Number.isFinite(repoId) || !repoFullName) {
+      return c.json({ error: 'repoId and repoFullName required' }, 400);
+    }
+    if (perPrAmountUsdc == null || perPrAmountUsdc < MIN_PRICE_USDC) {
+      return c.json({ error: `perPrAmountUsdc must be at least ${MIN_PRICE_USDC}` }, 400);
+    }
+
+    const policy = await upsertPolicy(getSupabaseClient(), {
+      repoId,
+      repoFullName,
+      perPrAmountUsdc,
+      dailyCapUsdc,
+      budgetRemainingUsdc,
+      active: body.active !== false,
+    });
+    if (!policy) return c.json({ error: 'failed to save policy' }, 500);
+    return c.json({ policy }, 201);
+  } catch (err) {
+    console.error('[creator-paywall] pr-payout-policy POST error:', err);
+    return c.json({ error: err instanceof Error ? err.message : 'Internal error' }, 500);
+  }
+});
+
+app.get('/citation/sources', async (c) => {
+  try {
+    const sources = await listCitationSources(getSupabaseClient());
+    return c.json({ sources });
+  } catch (err) {
+    console.error('[creator-paywall] citation sources GET error:', err);
+    return c.json({ error: err instanceof Error ? err.message : 'Internal error' }, 500);
+  }
+});
+
+app.post('/citation/sources', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const { source, error } = await registerCitationSourceFromBody(
+      getSupabaseClient(),
+      body,
+      generateIdentityHash,
+    );
+    if (error) return c.json({ error }, 400);
+    if (!source) return c.json({ error: 'failed to register source' }, 500);
+    return c.json({ source }, 201);
+  } catch (err) {
+    console.error('[creator-paywall] citation sources POST error:', err);
+    return c.json({ error: err instanceof Error ? err.message : 'Internal error' }, 500);
+  }
+});
+
+app.post('/citation/seed-from-paywalls', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const slugs = Array.isArray(body.slugs)
+      ? body.slugs.map((s: unknown) => String(s).trim()).filter(Boolean)
+      : [];
+    const demoSlug = Deno.env.get('LEPTON_DEMO_SLUG')?.trim();
+    const toSeed = slugs.length ? slugs : demoSlug ? [demoSlug] : [];
+    if (!toSeed.length) return c.json({ error: 'provide slugs[] or set LEPTON_DEMO_SLUG' }, 400);
+
+    const sources = await seedCitationSourcesFromPaywalls(
+      getSupabaseClient(),
+      toSeed,
+      generateIdentityHash,
+    );
+    return c.json({ sources, count: sources.length });
+  } catch (err) {
+    console.error('[creator-paywall] citation seed error:', err);
+    return c.json({ error: err instanceof Error ? err.message : 'Internal error' }, 500);
+  }
+});
+
+app.post('/citation/demo-run', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const question =
+      typeof body.question === 'string' && body.question.trim()
+        ? body.question.trim()
+        : 'What is Sendly social identity settlement on Arc?';
+
+    const result = await runCitationDemo(getPrPayoutDeps(), question);
+    return c.json(result);
+  } catch (err) {
+    console.error('[creator-paywall] citation demo-run error:', err);
+    const msg = err instanceof Error ? err.message : 'Internal error';
+    const status = msg === 'no_active_slug_sources' || msg === 'no_paywalls_resolved_for_sources' ? 400 : 500;
+    return c.json({ error: msg }, status);
   }
 });
 
