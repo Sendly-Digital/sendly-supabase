@@ -56,6 +56,12 @@ import {
   updateCampaign,
   upsertRaidPolicy,
 } from './twitchCampaigns.ts';
+import openApiDocument from './openapi.json' with { type: 'json' };
+import llmBundle from './llm.json' with { type: 'json' };
+
+function getLlmsDocument(): string {
+  return llmBundle.content;
+}
 
 const corsHeaders: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
@@ -782,195 +788,21 @@ app.get('/lepton-hackathon', (c) => {
 });
 
 app.get('/openapi.json', (c) => {
-  const chainId = getArcChainId();
-  const contractAddress = getZkSendContractAddress();
-  return c.json({
-    openapi: '3.1.0',
-    info: {
-      title: 'Sendly Creator Paywall',
-      version: '1.0.0',
-      description:
-        'HTTP 402 paywall with Arc USDC settlement via ZkSend to a social identity (twitter, github, twitch, gmail, linkedin, telegram). Read the target platform/handle from the 402 response (paywall.recipient).',
-    },
-    paths: {
-      '/paywall/{slug}': {
-        get: {
-          summary: 'Access paid content',
-          parameters: [
-            { name: 'slug', in: 'path', required: true, schema: { type: 'string' } },
-            { name: 'X-Sendly-Payment-Id', in: 'header', schema: { type: 'string' } },
-            { name: 'X-Sendly-Tx-Hash', in: 'header', schema: { type: 'string' } },
-            { name: 'X-Sendly-Source', in: 'header', schema: { type: 'string', enum: ['human', 'agent'] } },
-          ],
-          responses: {
-            '200': { description: 'Unlocked content' },
-            '402': { description: 'Payment required - pay via ZkSend.createPayment on Arc' },
-          },
-        },
-      },
-      '/paywall': {
-        post: {
-          summary: 'Create paywall (authenticated creator; GitHub verified, other platforms attested)',
-          requestBody: {
-            required: true,
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  required: ['slug', 'handle', 'priceUsdc', 'title', 'contentBody'],
-                },
-              },
-            },
-          },
-        },
-      },
-      '/creator/{platform}/{handle}': {
-        get: {
-          summary: 'Public creator profile with active article metadata (no content_body)',
-          parameters: [
-            { name: 'platform', in: 'path', required: true, schema: { type: 'string' } },
-            { name: 'handle', in: 'path', required: true, schema: { type: 'string' } },
-          ],
-          responses: {
-            '200': { description: 'Profile and article list' },
-            '404': { description: 'Profile not found' },
-          },
-        },
-      },
-      '/creator/profile': {
-        post: { summary: 'Idempotent upsert of creator profile (GitHub verified, others attested)' },
-        patch: { summary: 'Update creator profile display_name/bio/avatar_url (owner only)' },
-      },
-      '/webhooks/github': {
-        post: {
-          summary: 'GitHub webhook (Repo Treasury) - dispatched by X-GitHub-Event',
-          description:
-            'Requires X-Hub-Signature-256 (HMAC-SHA256). Handles pull_request (merge payout + bounty resolve + review settle), issues (bounty:<amount> label), release (published → split pool among authors), pull_request_review (review escrow). Unknown events are ignored.',
-        },
-      },
-      '/pr-payouts': {
-        get: {
-          summary: 'List repo payout receipts (all kinds: merge, bounty, release, review)',
-          responses: { '200': { description: 'Payout events with kind, tx_hash, claim_status, skip_reason' } },
-        },
-      },
-      '/pr-payout-policy': {
-        get: { summary: 'List repo payout policies (sponsor pool, per-PR amount, caps)' },
-        post: { summary: 'Upsert payout policy for a demo repo' },
-      },
-      '/citation/sources': {
-        get: { summary: 'List active citation sources (slug or external URL)' },
-        post: { summary: 'Register citation source' },
-      },
-      '/citation/demo-run': {
-        post: {
-          summary: 'Run demo research agent - real 402-style payments for registered paywall slugs',
-        },
-      },
-      '/webhooks/twitch': {
-        post: {
-          summary: 'Twitch EventSub webhook (Stream Treasury / Raid-to-Pay)',
-          description:
-            'Handles webhook_callback_verification (returns challenge), notification (channel.raid → pay twitch:uid:{raider}), revocation. HMAC: Twitch-Eventsub-Message-Signature over message_id + timestamp + body.',
-        },
-      },
-      '/twitch/campaigns': {
-        get: { summary: 'List Twitch raid payout campaigns' },
-        post: { summary: 'Create campaign (draft or active)' },
-      },
-      '/twitch/campaigns/{id}': {
-        patch: { summary: 'Update campaign status, budget, dates' },
-      },
-      '/twitch/payout-policy': {
-        post: { summary: 'Upsert raid payout policy for a campaign' },
-      },
-      '/twitch/payout-policies': {
-        get: { summary: 'List Twitch payout policies' },
-      },
-      '/twitch-payouts': {
-        get: {
-          summary: 'List Twitch raid payout receipts',
-          responses: { '200': { description: 'Payout events with tx_hash, claim_status, skip_reason' } },
-        },
-      },
-      '/twitch/identity/{userId}': {
-        get: {
-          summary: 'Lookup canonical twitch:uid identity hash and login snapshot',
-          parameters: [{ name: 'userId', in: 'path', required: true, schema: { type: 'string' } }],
-        },
-      },
-    },
-    'x-settlement': {
-      chainId,
-      contractAddress,
-      usdcAddress: getArcUsdcAddress(),
-      method: 'ZkSend.createPayment',
-      platformSource: 'Read per-paywall from the 402 response: paywall.recipient.platform',
-      supportedPlatforms: ['twitter', 'github', 'twitch', 'gmail', 'linkedin', 'telegram'],
-    },
-  });
+  const doc = structuredClone(openApiDocument) as Record<string, unknown>;
+  const settlement = (doc['x-settlement'] as Record<string, unknown> | undefined) ?? {};
+  doc['x-settlement'] = {
+    ...settlement,
+    chainId: getArcChainId(),
+    contractAddress: getZkSendContractAddress(),
+    usdcAddress: getArcUsdcAddress(),
+    method: 'ZkSend.createPayment',
+    minPriceUsdc: String(MIN_PRICE_USDC),
+  };
+  return c.json(doc);
 });
 
 app.get('/llms.txt', (c) => {
-  const base = Deno.env.get('PUBLIC_CREATOR_PAYWALL_URL')?.trim() || '/functions/v1/creator-paywall';
-  const text = `# Sendly Creator Paywall (Arc USDC / ZkSend)
-
-Settlement: ZkSend.createPayment on Arc Testnet USDC to a social identity <platform>:<handle>.
-The platform is NOT always github - read it from the 402 response (paywall.recipient.platform).
-
-## Unlock flow (paywall / citation)
-1. GET ${base}/paywall/{slug}
-2. If HTTP 402, read JSON paywall instructions (identityHash, priceUsdc, contractAddress, recipient.platform, recipient.handle).
-3. On Arc: approve USDC then ZkSend.createPayment(identityHash, recipient.platform, amountWei, usdc).
-   Use the exact platform from the 402 response (e.g. "twitter" or "github") - a wrong platform will not match identityHash.
-   Agent option: circle wallet execute --chain ARC-TESTNET (see Circle Agent Stack docs).
-4. POST payment index to /zk-sender/payments (optional but recommended).
-5. Retry GET with headers:
-   - X-Sendly-Payment-Id: <paymentId>
-   - X-Sendly-Tx-Hash: <txHash>
-   - X-Sendly-Source: agent|human
-6. HTTP 200 returns content_body.
-
-## PR Payout Agent (hero - Lepton)
-1. Maintainer configures policy: POST ${base}/pr-payout-policy (repo_id, per_pr_amount_usdc, caps).
-2. GitHub webhook: POST ${base}/webhooks/github (pull_request closed + merged=true).
-3. Agent checks policy, anti-abuse (bots, self-merge, budget), pays github:author from sponsor pool via ZkSend.
-4. Receipts: GET ${base}/pr-payouts (tx_hash, claim_status).
-5. Contributor claims via existing Sendly zkTLS GitHub ownership - no wallet required upfront.
-
-## Repo Treasury - more GitHub events (same rail)
-Webhook is dispatched by X-GitHub-Event. Configure the demo repo webhook for: pull_request, issues, release, pull_request_review.
-- Issue Bounty Escrow: label an issue "bounty:<amount>" (e.g. bounty:2). When a merged PR closes it (Fixes/Closes/Resolves #N) the PR author is paid the bounty. Label must exist before merge; one issue paid once.
-- Release Dividend: on a published release, the release_pool_usdc is split equally among distinct non-bot authors of PRs since the previous release (requires GITHUB_API_TOKEN for compare).
-- Review-to-Earn: a submitted review (changes_requested, or approved with body >= review_min_chars) is escrowed; reviewers (not the author, capped by max_reviewers_per_pr) are paid review_amount_usdc when the PR merges.
-Policy per-kind: bounty_enabled, release_pool_usdc, split_mode, review_amount_usdc, review_min_chars, max_reviewers_per_pr.
-Receipts include a "kind" field (merge|bounty|release|review) and skip_reason for audit.
-
-## Twitch Stream Treasury / Raid-to-Pay (Lepton)
-Canonical identity: twitch:uid:{user_id} (hash = keccak256("twitch:uid:{user_id}")). Login is snapshot only.
-
-1. Create campaign: POST ${base}/twitch/campaigns { sponsorId, broadcasterUserId, name, totalBudgetUsdc, status: "active" }.
-2. Set raid policy: POST ${base}/twitch/payout-policy { campaignId, ratePerViewerUsdc, maxPerEventUsdc, minViewers, maxPerDayUsdc }.
-3. EventSub webhook: POST ${base}/webhooks/twitch (channel.raid on to_broadcaster_user_id).
-4. On raid: pays twitch:uid:{from_broadcaster_user_id} (raider) from campaign budget via ZkSend.
-5. Receipts: GET ${base}/twitch-payouts (tx_hash, claim_status).
-6. Identity lookup: GET ${base}/twitch/identity/{userId}.
-7. Contributor claims via zkTLS Twitch proof with contextMessage = "twitch:uid:{id}".
-
-Formula: amount = min(viewers * rate_per_viewer, max_per_event); skip if viewers < min_viewers.
-Anti-abuse: self_raid, allowlist, one payout per raider per campaign per UTC day, campaign + policy daily caps.
-Feature flag: TWITCH_RAID_PAYOUTS_ENABLED=true required for raid processing (verification challenge always accepted).
-
-## Citation via 402
-1. Register sources: GET/POST ${base}/citation/sources (slug = existing paywall, or external url for registry).
-2. Demo agent: POST ${base}/citation/demo-run { "question": "..." } - pays each slug via real Arc tx, returns cited answer.
-3. Same settlement as paywall unlock - attribution becomes settlement.
-
-Browse a creator's articles: GET ${base}/creator/{platform}/{handle} (metadata only, no content_body).
-Min price: ${MIN_PRICE_USDC} USDC.
-Supported platforms: twitter, github, twitch, gmail, linkedin, telegram (github ownership is server-verified; others are OAuth-attested).
-`;
-  return c.text(text, 200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  return c.text(getLlmsDocument(), 200, { 'Content-Type': 'text/plain; charset=utf-8' });
 });
 
 app.get('/paywall/*', async (c) => {

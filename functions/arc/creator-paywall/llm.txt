@@ -1,0 +1,545 @@
+# Sendly Agent Settlement API
+
+Agent documentation:
+
+`https://sendly.digital/llms.txt`
+
+OpenAPI spec:
+
+`https://sendly.digital/openapi.json`
+
+---
+
+## Arc USDC / ZkSend / Social Identity Settlement
+
+Sendly settles USDC on Arc Testnet via `ZkSend.createPayment` to a **social identity**, not a wallet address.
+
+Canonical recipient format:
+
+`<platform>:<handle>`
+
+Primary treasury platforms:
+
+`github`, `twitch`
+
+HTTP `402 Payment Required` is the agent payment protocol when an endpoint requires on-chain settlement before access.
+
+Always read `platform` and `identityHash` from the `402` response body. Wrong platform produces a payment that does not match the expected identity hash.
+
+---
+
+# Base URL
+
+`https://eiiprokgcuksmunmszxf.supabase.co/functions/v1/creator-paywall`
+
+---
+
+# Settlement
+
+Chain:
+
+`Arc Testnet`
+
+Chain ID:
+
+`5042002`
+
+USDC token:
+
+`0x3600000000000000000000000000000000000000`
+
+ZkSend contract:
+
+`0x33783a585504025e66b8f8f6451de0c23158a3cb`
+
+Settlement method:
+
+`ZkSend.createPayment`
+
+Use USDC atomic units, not ETH wei.
+
+USDC has 6 decimals.
+
+Examples:
+
+`0.5 USDC = 500000`
+`1 USDC = 1000000`
+`2.5 USDC = 2500000`
+
+---
+
+# HTTP 402 Agent Payment
+
+When a protected endpoint returns HTTP `402`, read payment instructions from the JSON body.
+
+Typical fields:
+
+`priceUsdc`
+`recipient.platform`
+`recipient.handle`
+`identityHash`
+`chainId`
+`usdcAddress`
+`contractAddress`
+
+Example recipient:
+
+```json
+{
+  "platform": "github",
+  "handle": "hazyshades"
+}
+```
+
+Do not assume the platform. Use the exact value from the `402` response.
+
+---
+
+## Execute payment on Arc
+
+Approve:
+
+`USDC.approve(contractAddress, amountAtomic)`
+
+Then call:
+
+`ZkSend.createPayment(identityHash, platform, amountAtomic, usdcAddress)`
+
+Where:
+
+`identityHash` and `platform` come from the `402` response
+`amountAtomic = priceUsdc * 1_000_000`
+`usdcAddress` from the `402` response
+
+Agent execution may use Circle Wallet execution if available.
+
+---
+
+## Retry with payment proof
+
+After the Arc transaction is submitted, retry the original request with:
+
+`X-Sendly-Payment-Id: <paymentId>`
+`X-Sendly-Tx-Hash: <txHash>`
+`X-Sendly-Source: agent`
+
+Allowed source values:
+
+`agent`
+`human`
+
+---
+
+# PR Payout Agent
+
+Maintainers configure a repo treasury policy. Eligible GitHub events trigger autonomous USDC payouts to GitHub identity via ZkSend.
+
+Recipient format:
+
+`github:<author_login>`
+
+Contributor does not need a wallet upfront.
+
+Contributor claims through Sendly zkTLS GitHub ownership verification.
+
+---
+
+## 1. Configure payout policy
+
+`POST /pr-payout-policy`
+
+Example:
+
+`POST https://eiiprokgcuksmunmszxf.supabase.co/functions/v1/creator-paywall/pr-payout-policy`
+
+Core fields (camelCase in JSON body):
+
+`repoId`
+`repoFullName`
+`perPrAmountUsdc`
+`dailyCapUsdc`
+`budgetRemainingUsdc`
+`active`
+`bountyEnabled`
+`releasePoolUsdc`
+`splitMode`
+`reviewAmountUsdc`
+`reviewMinChars`
+`maxReviewersPerPr`
+
+Live demo policy (`Hazyshades/Sendly-Test-Repo`):
+
+```json
+{
+  "repoId": 1287958084,
+  "repoFullName": "Hazyshades/Sendly-Test-Repo",
+  "perPrAmountUsdc": 10,
+  "dailyCapUsdc": 50,
+  "budgetRemainingUsdc": 120,
+  "active": true,
+  "bountyEnabled": true,
+  "releasePoolUsdc": 20,
+  "splitMode": "equal",
+  "reviewAmountUsdc": 15,
+  "reviewMinChars": 20,
+  "maxReviewersPerPr": 2
+}
+```
+
+Payout kinds: merge **10 USDC** · release pool **20 USDC** · review **15 USDC** per reviewer (max 2).
+
+---
+
+## 2. GitHub webhook
+
+`POST /webhooks/github`
+
+Example:
+
+`POST https://eiiprokgcuksmunmszxf.supabase.co/functions/v1/creator-paywall/webhooks/github`
+
+Required header:
+
+`X-GitHub-Event`
+
+Security header:
+
+`X-Hub-Signature-256`
+
+Signature:
+
+HMAC-SHA256 over the raw request body.
+
+Supported events:
+
+`pull_request`
+`issues`
+`release`
+`pull_request_review`
+
+Unknown events are ignored.
+
+---
+
+## 3. Merge payout
+
+Trigger:
+
+`pull_request closed` with `merged=true`
+
+Agent checks:
+
+repo policy
+budget
+caps
+bot filtering
+self-merge rules
+anti-abuse rules
+
+If eligible, the agent pays:
+
+`github:<pull_request_author>`
+
+---
+
+## 4. Receipts
+
+`GET /pr-payouts`
+
+Returns payout receipts for all payout kinds.
+
+Receipt fields include:
+
+`kind`
+`tx_hash`
+`claim_status`
+`skip_reason`
+
+Supported kinds:
+
+`merge`
+`bounty`
+`release`
+`review`
+
+---
+
+# Repo Treasury Events
+
+GitHub webhook dispatch is based on:
+
+`X-GitHub-Event`
+
+Configure the demo repo webhook for:
+
+`pull_request`
+`issues`
+`release`
+`pull_request_review`
+
+---
+
+## Issue Bounty Escrow
+
+Create a GitHub issue label:
+
+`bounty:<amount>`
+
+Example:
+
+`bounty:2`
+
+When a merged PR closes the issue using:
+
+`Fixes #N`
+`Closes #N`
+`Resolves #N`
+
+the PR author is paid the bounty.
+
+Rules:
+
+The bounty label must exist before merge.
+Each issue can be paid once.
+The PR author must pass anti-abuse checks.
+
+---
+
+## Release Dividend
+
+Trigger:
+
+`release published`
+
+The `release_pool_usdc` is split among distinct non-bot PR authors since the previous release.
+
+Requires:
+
+`GITHUB_API_TOKEN`
+
+Used for GitHub compare/history lookup.
+
+---
+
+## Review-to-Earn
+
+Trigger:
+
+`pull_request_review submitted`
+
+Eligible reviews:
+
+`changes_requested`
+`approved` with body length greater than or equal to `review_min_chars`
+
+Rules:
+
+Reviewer cannot be the PR author.
+Reviewers are capped by `max_reviewers_per_pr`.
+Review payout is escrowed first.
+Reviewers are paid when the PR merges.
+
+---
+
+# Twitch Stream Treasury / Raid-to-Pay
+
+Canonical Twitch identity:
+
+`twitch:uid:{user_id}`
+
+Canonical identity hash:
+
+`keccak256("twitch:uid:{user_id}")`
+
+Twitch login is a snapshot only. The canonical recipient is based on Twitch user ID, not mutable login.
+
+---
+
+## 1. Create campaign
+
+`POST /twitch/campaigns`
+
+Example body:
+
+```json
+{
+  "sponsorId": "lepton-demo",
+  "broadcasterUserId": "126247254",
+  "broadcasterLoginSnapshot": "kurdypel",
+  "name": "Raid-to-Pay Demo",
+  "totalBudgetUsdc": 10,
+  "status": "active"
+}
+```
+
+---
+
+## 2. Set raid payout policy
+
+`POST /twitch/payout-policy`
+
+Example body:
+
+```json
+{
+  "campaignId": "7fa09b5d-222c-43f3-9b64-687d7bb68b39",
+  "minViewers": 5,
+  "ratePerViewerUsdc": 0.01,
+  "maxPerEventUsdc": 2,
+  "maxPerDayUsdc": 10,
+  "enabled": true
+}
+```
+
+Live formula example: 25 viewers → `min(25 * 0.01, 2)` = **0.25 USDC** to raider.
+
+---
+
+## 3. Twitch EventSub webhook
+
+`POST /webhooks/twitch`
+
+Example:
+
+`POST https://eiiprokgcuksmunmszxf.supabase.co/functions/v1/creator-paywall/webhooks/twitch`
+
+Supported EventSub message types:
+
+`webhook_callback_verification`
+`notification`
+`revocation`
+
+For verification, return the Twitch challenge.
+
+For notifications, handle:
+
+`channel.raid`
+
+Security header:
+
+`Twitch-Eventsub-Message-Signature`
+
+Signature payload:
+
+`message_id + timestamp + raw_body`
+
+---
+
+## 4. Raid payout
+
+On `channel.raid`, pay the raider:
+
+`twitch:uid:{from_broadcaster_user_id}`
+
+The payout comes from the campaign budget.
+
+Formula:
+
+`amount = min(viewers * rate_per_viewer, max_per_event)`
+
+Skip payout if:
+
+`viewers < min_viewers`
+
+Anti-abuse checks:
+
+self raid
+allowlist
+one payout per raider per campaign per UTC day
+campaign budget cap
+policy daily cap
+
+Feature flag:
+
+`TWITCH_RAID_PAYOUTS_ENABLED=true`
+
+The verification challenge should still be accepted even when raid payout processing is disabled.
+
+---
+
+## 5. Twitch receipts
+
+`GET /twitch-payouts`
+
+Returns raid payout receipts.
+
+Receipt fields include:
+
+`tx_hash`
+`claim_status`
+`skip_reason`
+
+---
+
+## 6. Twitch identity lookup
+
+`GET /twitch/identity/{userId}`
+
+Returns canonical Twitch identity data:
+
+`twitch:uid:{user_id}`
+`identityHash`
+`login snapshot`
+
+---
+
+## 7. Twitch claim flow
+
+Contributor claims through zkTLS Twitch proof.
+
+Required context message:
+
+`twitch:uid:{id}`
+
+---
+
+# Pricing
+
+Minimum on-chain payout:
+
+`0.5 USDC`
+
+Use USDC atomic units when paying:
+
+`0.5 USDC = 500000`
+`1 USDC = 1000000`
+`10 USDC = 10000000`
+
+## Live demo snapshot (Jul 2026)
+
+| Surface | Amount |
+| --- | --- |
+| GitHub merge PR | 10 USDC |
+| GitHub release pool | 20 USDC (split) |
+| GitHub review | 15 USDC / reviewer |
+| GitHub daily cap | 50 USDC |
+| Twitch campaign budget | 10 USDC |
+| Twitch raid | 0.01 USDC/viewer, min 5 viewers, cap 2 USDC/event, 10 USDC/day |
+
+Machine-readable: `GET /openapi.json` (see `x-demo-pricing`).
+
+---
+
+# Important Agent Rules
+
+Never assume the platform is GitHub.
+
+Always read `platform` and `identityHash` from the `402` response or treasury receipt.
+
+Always pay in USDC atomic units.
+
+Do not use ETH wei for USDC amounts.
+
+For HTTP 402 flows, retry with:
+
+`X-Sendly-Payment-Id`
+`X-Sendly-Tx-Hash`
+`X-Sendly-Source`
+
+If payment succeeds but access fails, check:
+
+wrong platform
+wrong identityHash
+wrong amount decimals
+wrong chain
+missing retry headers

@@ -547,60 +547,86 @@ export async function upsertPolicy(
   return data as PrPayoutPolicyRow;
 }
 
-export async function syncClaimStatuses(deps: PrPayoutDeps): Promise<number> {
-  const client = deps.getClient();
-  const { zkSendAddress } = deps.getArcConfig();
+const ZKSEND_PAYMENTS_ABI = [
+  {
+    inputs: [{ name: '', type: 'uint256' }],
+    name: 'payments',
+    outputs: [
+      { name: 'paymentId', type: 'uint256' },
+      { name: 'sender', type: 'address' },
+      { name: 'socialIdentityHash', type: 'bytes32' },
+      { name: 'platform', type: 'string' },
+      { name: 'amount', type: 'uint256' },
+      { name: 'token', type: 'address' },
+      { name: 'recipient', type: 'address' },
+      { name: 'claimed', type: 'bool' },
+      { name: 'createdAt', type: 'uint256' },
+      { name: 'claimedAt', type: 'uint256' },
+    ],
+    stateMutability: 'view',
+    type: 'function',
+  },
+] as const;
+
+async function isZkSendPaymentClaimed(
+  publicClient: ReturnType<typeof createArcPublicClient>,
+  zkSendAddress: Address,
+  paymentId: string,
+): Promise<boolean> {
+  if (!/^\d+$/.test(paymentId)) return false;
+  try {
+    const onChain = (await publicClient.readContract({
+      address: zkSendAddress,
+      abi: ZKSEND_PAYMENTS_ABI,
+      functionName: 'payments',
+      args: [BigInt(paymentId)],
+    })) as readonly unknown[];
+    return Boolean(onChain[7]);
+  } catch {
+    return false;
+  }
+}
+
+async function syncTableClaimStatuses(
+  client: SupabaseClient,
+  publicClient: ReturnType<typeof createArcPublicClient>,
+  zkSendAddress: Address,
+  table: 'github_pr_payouts' | 'github_payouts',
+  limit: number,
+): Promise<number> {
   const { data: pending } = await client
-    .from('github_pr_payouts')
+    .from(table)
     .select('id, payment_id')
     .eq('status', 'paid')
     .eq('claim_status', 'pending')
     .not('payment_id', 'is', null)
-    .limit(50);
+    .limit(limit);
 
   if (!pending?.length) return 0;
 
-  const publicClient = createArcPublicClient();
   let updated = 0;
-
   for (const row of pending) {
-    if (!row.payment_id || !/^\d+$/.test(row.payment_id)) continue;
-    try {
-      const onChain = (await publicClient.readContract({
-        address: zkSendAddress as Address,
-        abi: [
-          {
-            inputs: [{ name: '', type: 'uint256' }],
-            name: 'payments',
-            outputs: [
-              { name: 'paymentId', type: 'uint256' },
-              { name: 'sender', type: 'address' },
-              { name: 'socialIdentityHash', type: 'bytes32' },
-              { name: 'platform', type: 'string' },
-              { name: 'amount', type: 'uint256' },
-              { name: 'token', type: 'address' },
-              { name: 'recipient', type: 'address' },
-              { name: 'claimed', type: 'bool' },
-              { name: 'createdAt', type: 'uint256' },
-              { name: 'claimedAt', type: 'uint256' },
-            ],
-            stateMutability: 'view',
-            type: 'function',
-          },
-        ],
-        functionName: 'payments',
-        args: [BigInt(row.payment_id)],
-      })) as readonly unknown[];
-      const claimed = Boolean(onChain[7]);
-      if (claimed) {
-        await updateReceipt(client, row.id, { claim_status: 'claimed' });
-        updated++;
-      }
-    } catch {
-      // ignore per-row errors
-    }
+    if (!row.payment_id || typeof row.payment_id !== 'string') continue;
+    const claimed = await isZkSendPaymentClaimed(publicClient, zkSendAddress, row.payment_id);
+    if (!claimed) continue;
+    const { error } = await client
+      .from(table)
+      .update({ claim_status: 'claimed' })
+      .eq('id', row.id);
+    if (!error) updated++;
+    else console.error(`[pr-payout] sync claim_status error (${table}):`, error);
   }
   return updated;
+}
+
+export async function syncClaimStatuses(deps: PrPayoutDeps): Promise<number> {
+  const client = deps.getClient();
+  const { zkSendAddress } = deps.getArcConfig();
+  const publicClient = createArcPublicClient();
+  const address = zkSendAddress as Address;
+  const hero = await syncTableClaimStatuses(client, publicClient, address, 'github_pr_payouts', 50);
+  const ledger = await syncTableClaimStatuses(client, publicClient, address, 'github_payouts', 100);
+  return hero + ledger;
 }
 
 export function buildIdentityHash(platform: string, handle: string): `0x${string}` {

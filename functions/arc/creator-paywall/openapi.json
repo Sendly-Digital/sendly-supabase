@@ -1,0 +1,1947 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Sendly Agent Settlement API",
+    "version": "1.0.0",
+    "description": "Arc USDC settlement via ZkSend to social identity (github, twitch). HTTP 402 agent payment protocol plus GitHub Repo Treasury and Twitch Raid-to-Pay webhooks. Read recipient.platform and identityHash from 402 responses or treasury receipts."
+  },
+  "servers": [
+    {
+      "url": "https://sendly.digital",
+      "description": "Agent docs mirror (llms.txt, openapi.json)"
+    },
+    {
+      "url": "https://eiiprokgcuksmunmszxf.supabase.co/functions/v1/creator-paywall",
+      "description": "Supabase Edge (production API)"
+    }
+  ],
+  "tags": [
+    {
+      "name": "GitHub Treasury",
+      "description": "Repo treasury payouts triggered by GitHub events"
+    },
+    {
+      "name": "Twitch Treasury",
+      "description": "Raid-to-pay campaigns and Twitch EventSub payouts"
+    },
+    {
+      "name": "Settlement",
+      "description": "Arc USDC settlement metadata"
+    }
+  ],
+  "paths": {
+    "/webhooks/github": {
+      "post": {
+        "tags": [
+          "GitHub Treasury"
+        ],
+        "operationId": "handleGitHubWebhook",
+        "summary": "Handle GitHub webhook",
+        "description": "Requires X-Hub-Signature-256 (HMAC-SHA256). Handles pull_request (merge payout, bounty resolve, review settle), issues (bounty:<amount> label), release (published → split pool among authors), and pull_request_review (review escrow). Unknown events are ignored.",
+        "security": [
+          {
+            "githubWebhookSignature": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XGitHubEvent"
+          },
+          {
+            "$ref": "#/components/parameters/XHubSignature256"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Webhook accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookAcceptedResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/pr-payouts": {
+      "get": {
+        "tags": [
+          "GitHub Treasury"
+        ],
+        "operationId": "listPrPayouts",
+        "summary": "List repo payout receipts",
+        "description": "Lists repo payout receipts for all kinds: merge, bounty, release, and review.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RepoFullNameQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          },
+          {
+            "$ref": "#/components/parameters/CursorQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payout events with kind, txHash, claimStatus, and skipReason",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PayoutReceiptListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/pr-payout-policy": {
+      "get": {
+        "tags": [
+          "GitHub Treasury"
+        ],
+        "operationId": "listPrPayoutPolicies",
+        "summary": "List repo payout policies",
+        "description": "Lists repo payout policies, including sponsor pool, per-PR amount, and caps.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RepoFullNameQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Repo payout policies",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepoPayoutPolicyListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "GitHub Treasury"
+        ],
+        "operationId": "upsertPrPayoutPolicy",
+        "summary": "Upsert payout policy for a demo repo",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertRepoPayoutPolicyRequest"
+              },
+              "examples": {
+                "sendlyTestRepo": {
+                  "value": {
+                    "repoId": 1287958084,
+                    "repoFullName": "Hazyshades/Sendly-Test-Repo",
+                    "perPrAmountUsdc": 10,
+                    "dailyCapUsdc": 50,
+                    "budgetRemainingUsdc": 120,
+                    "active": true,
+                    "bountyEnabled": true,
+                    "releasePoolUsdc": 20,
+                    "splitMode": "equal",
+                    "reviewAmountUsdc": 15,
+                    "reviewMinChars": 20,
+                    "maxReviewersPerPr": 2
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Repo payout policy upserted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepoPayoutPolicy"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/webhooks/twitch": {
+      "post": {
+        "tags": [
+          "Twitch Treasury"
+        ],
+        "operationId": "handleTwitchWebhook",
+        "summary": "Handle Twitch EventSub webhook",
+        "description": "Handles webhook_callback_verification by returning the challenge, notification (channel.raid → pay twitch:uid:{raider}), and revocation. HMAC uses Twitch-Eventsub-Message-Signature over message_id + timestamp + body.",
+        "security": [
+          {
+            "twitchEventSubSignature": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TwitchEventSubMessageId"
+          },
+          {
+            "$ref": "#/components/parameters/TwitchEventSubMessageTimestamp"
+          },
+          {
+            "$ref": "#/components/parameters/TwitchEventSubMessageSignature"
+          },
+          {
+            "$ref": "#/components/parameters/TwitchEventSubMessageType"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Webhook accepted, revocation accepted, or challenge returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwitchWebhookResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Challenge response for webhook_callback_verification"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/twitch/campaigns": {
+      "get": {
+        "tags": [
+          "Twitch Treasury"
+        ],
+        "operationId": "listTwitchCampaigns",
+        "summary": "List Twitch raid payout campaigns",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          },
+          {
+            "$ref": "#/components/parameters/CursorQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Twitch raid payout campaigns",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwitchCampaignListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Twitch Treasury"
+        ],
+        "operationId": "createTwitchCampaign",
+        "summary": "Create Twitch raid payout campaign",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTwitchCampaignRequest"
+              },
+              "examples": {
+                "raidDemo": {
+                  "value": {
+                    "sponsorId": "lepton-demo",
+                    "broadcasterUserId": "126247254",
+                    "broadcasterLoginSnapshot": "kurdypel",
+                    "name": "Raid-to-Pay Demo",
+                    "totalBudgetUsdc": 10,
+                    "status": "active"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Twitch raid payout campaign created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwitchCampaign"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/twitch/campaigns/{id}": {
+      "patch": {
+        "tags": [
+          "Twitch Treasury"
+        ],
+        "operationId": "updateTwitchCampaign",
+        "summary": "Update Twitch campaign",
+        "description": "Updates campaign status, budget, and dates.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTwitchCampaignRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Twitch raid payout campaign updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwitchCampaign"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/twitch/payout-policy": {
+      "post": {
+        "tags": [
+          "Twitch Treasury"
+        ],
+        "operationId": "upsertTwitchPayoutPolicy",
+        "summary": "Upsert raid payout policy for a campaign",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertTwitchPayoutPolicyRequest"
+              },
+              "examples": {
+                "raidPolicy": {
+                  "value": {
+                    "campaignId": "7fa09b5d-222c-43f3-9b64-687d7bb68b39",
+                    "minViewers": 5,
+                    "ratePerViewerUsdc": 0.01,
+                    "maxPerEventUsdc": 2,
+                    "maxPerDayUsdc": 10,
+                    "enabled": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Twitch raid payout policy upserted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwitchPayoutPolicy"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/twitch/payout-policies": {
+      "get": {
+        "tags": [
+          "Twitch Treasury"
+        ],
+        "operationId": "listTwitchPayoutPolicies",
+        "summary": "List Twitch payout policies",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CampaignIdQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Twitch payout policies",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwitchPayoutPolicyListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/twitch-payouts": {
+      "get": {
+        "tags": [
+          "Twitch Treasury"
+        ],
+        "operationId": "listTwitchPayouts",
+        "summary": "List Twitch raid payout receipts",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CampaignIdQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          },
+          {
+            "$ref": "#/components/parameters/CursorQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payout events with txHash, claimStatus, and skipReason",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PayoutReceiptListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/twitch/identity/{userId}": {
+      "get": {
+        "tags": [
+          "Twitch Treasury"
+        ],
+        "operationId": "getTwitchIdentity",
+        "summary": "Lookup canonical Twitch identity",
+        "description": "Returns the canonical twitch:uid identity hash and login snapshot.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TwitchUserIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Canonical Twitch identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwitchIdentityResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      },
+      "githubWebhookSignature": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Hub-Signature-256",
+        "description": "GitHub webhook HMAC-SHA256 signature."
+      },
+      "twitchEventSubSignature": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "Twitch-Eventsub-Message-Signature",
+        "description": "Twitch EventSub HMAC signature."
+      }
+    },
+    "parameters": {
+      "SlugPath": {
+        "name": "slug",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        }
+      },
+      "PlatformPath": {
+        "name": "platform",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/Platform"
+        }
+      },
+      "HandlePath": {
+        "name": "handle",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        }
+      },
+      "IdPath": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "TwitchUserIdPath": {
+        "name": "userId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "XSendlyPaymentId": {
+        "name": "X-Sendly-Payment-Id",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "type": "string"
+        },
+        "description": "Sendly payment identifier returned by payment creation."
+      },
+      "XSendlyTxHash": {
+        "name": "X-Sendly-Tx-Hash",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "pattern": "^0x[a-fA-F0-9]{64}$"
+        },
+        "description": "Arc transaction hash for the payment."
+      },
+      "XSendlySource": {
+        "name": "X-Sendly-Source",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "human",
+            "agent"
+          ]
+        },
+        "description": "Source type that initiated the unlock request."
+      },
+      "XGitHubEvent": {
+        "name": "X-GitHub-Event",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "pull_request",
+            "issues",
+            "release",
+            "pull_request_review"
+          ]
+        }
+      },
+      "XHubSignature256": {
+        "name": "X-Hub-Signature-256",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^sha256=.+"
+        }
+      },
+      "TwitchEventSubMessageId": {
+        "name": "Twitch-Eventsub-Message-Id",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "TwitchEventSubMessageTimestamp": {
+        "name": "Twitch-Eventsub-Message-Timestamp",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "TwitchEventSubMessageSignature": {
+        "name": "Twitch-Eventsub-Message-Signature",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^sha256=.+"
+        }
+      },
+      "TwitchEventSubMessageType": {
+        "name": "Twitch-Eventsub-Message-Type",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "webhook_callback_verification",
+            "notification",
+            "revocation"
+          ]
+        }
+      },
+      "RepoFullNameQuery": {
+        "name": "repoFullName",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "pattern": "^[^/]+/[^/]+$"
+        },
+        "description": "GitHub repository in owner/repo format."
+      },
+      "CampaignIdQuery": {
+        "name": "campaignId",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "LimitQuery": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 50
+        }
+      },
+      "CursorQuery": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Bad request",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Unauthorized",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Forbidden",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "Conflict",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "InternalServerError": {
+        "description": "Internal server error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Platform": {
+        "type": "string",
+        "enum": [
+          "twitter",
+          "github",
+          "twitch",
+          "gmail",
+          "linkedin",
+          "telegram"
+        ]
+      },
+      "MoneyUsdc": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$",
+        "description": "USDC decimal amount as a string to avoid floating-point rounding issues."
+      },
+      "EvmAddress": {
+        "type": "string",
+        "pattern": "^0x[a-fA-F0-9]{40}$"
+      },
+      "TxHash": {
+        "type": "string",
+        "pattern": "^0x[a-fA-F0-9]{64}$"
+      },
+      "Recipient": {
+        "type": "object",
+        "required": [
+          "platform",
+          "handle",
+          "identity"
+        ],
+        "properties": {
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "handle": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "identity": {
+            "type": "string",
+            "description": "Canonical social identity, for example github:hazyshades or twitch:uid:123456."
+          }
+        },
+        "additionalProperties": false
+      },
+      "Settlement": {
+        "type": "object",
+        "required": [
+          "chainId",
+          "contractAddress",
+          "usdcAddress",
+          "method"
+        ],
+        "properties": {
+          "chainId": {
+            "type": "string",
+            "example": "5042002"
+          },
+          "contractAddress": {
+            "$ref": "#/components/schemas/EvmAddress"
+          },
+          "usdcAddress": {
+            "$ref": "#/components/schemas/EvmAddress"
+          },
+          "method": {
+            "type": "string",
+            "const": "ZkSend.createPayment"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ErrorBody": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorBody"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PaywallMetadata": {
+        "type": "object",
+        "required": [
+          "slug",
+          "title",
+          "priceUsdc",
+          "recipient",
+          "active"
+        ],
+        "properties": {
+          "slug": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "priceUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "recipient": {
+            "$ref": "#/components/schemas/Recipient"
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PaywallRequired": {
+        "type": "object",
+        "required": [
+          "slug",
+          "title",
+          "priceUsdc",
+          "recipient",
+          "settlement"
+        ],
+        "properties": {
+          "slug": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "priceUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "recipient": {
+            "$ref": "#/components/schemas/Recipient"
+          },
+          "settlement": {
+            "$ref": "#/components/schemas/Settlement"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PaywallRequiredResponse": {
+        "type": "object",
+        "required": [
+          "error",
+          "paywall"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorBody"
+          },
+          "paywall": {
+            "$ref": "#/components/schemas/PaywallRequired"
+          }
+        },
+        "additionalProperties": false
+      },
+      "UnlockedContent": {
+        "type": "object",
+        "required": [
+          "slug",
+          "title",
+          "contentBody"
+        ],
+        "properties": {
+          "slug": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "contentBody": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PaymentConfirmation": {
+        "type": "object",
+        "properties": {
+          "paymentId": {
+            "type": "string"
+          },
+          "txHash": {
+            "$ref": "#/components/schemas/TxHash"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "confirmed",
+              "failed"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "UnlockedContentResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "content"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "unlocked"
+          },
+          "content": {
+            "$ref": "#/components/schemas/UnlockedContent"
+          },
+          "payment": {
+            "$ref": "#/components/schemas/PaymentConfirmation"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreatePaywallRequest": {
+        "type": "object",
+        "required": [
+          "slug",
+          "platform",
+          "handle",
+          "priceUsdc",
+          "title",
+          "contentBody"
+        ],
+        "properties": {
+          "slug": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "handle": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "priceUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "contentBody": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArticleMetadata": {
+        "type": "object",
+        "required": [
+          "slug",
+          "title",
+          "priceUsdc",
+          "active"
+        ],
+        "properties": {
+          "slug": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "priceUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreatorProfile": {
+        "type": "object",
+        "required": [
+          "platform",
+          "handle",
+          "identity"
+        ],
+        "properties": {
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "handle": {
+            "type": "string"
+          },
+          "identity": {
+            "type": "string"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "bio": {
+            "type": "string"
+          },
+          "avatarUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "verified": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreatorProfileResponse": {
+        "type": "object",
+        "required": [
+          "profile",
+          "articles"
+        ],
+        "properties": {
+          "profile": {
+            "$ref": "#/components/schemas/CreatorProfile"
+          },
+          "articles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArticleMetadata"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpsertCreatorProfileRequest": {
+        "type": "object",
+        "required": [
+          "platform",
+          "handle"
+        ],
+        "properties": {
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "handle": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "displayName": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "bio": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "avatarUrl": {
+            "type": "string",
+            "format": "uri"
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateCreatorProfileRequest": {
+        "type": "object",
+        "properties": {
+          "displayName": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "bio": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "avatarUrl": {
+            "type": "string",
+            "format": "uri"
+          }
+        },
+        "minProperties": 1,
+        "additionalProperties": false
+      },
+      "WebhookAcceptedResponse": {
+        "type": "object",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "ignored": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PayoutKind": {
+        "type": "string",
+        "enum": [
+          "merge",
+          "bounty",
+          "release",
+          "review",
+          "raid"
+        ]
+      },
+      "ClaimStatus": {
+        "type": "string",
+        "enum": [
+          "unclaimed",
+          "claimable",
+          "claimed",
+          "skipped",
+          "failed"
+        ]
+      },
+      "PayoutReceipt": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "recipient",
+          "amountUsdc",
+          "claimStatus",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/PayoutKind"
+          },
+          "recipient": {
+            "$ref": "#/components/schemas/Recipient"
+          },
+          "amountUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "txHash": {
+            "$ref": "#/components/schemas/TxHash"
+          },
+          "claimStatus": {
+            "$ref": "#/components/schemas/ClaimStatus"
+          },
+          "skipReason": {
+            "type": "string"
+          },
+          "repoFullName": {
+            "type": "string"
+          },
+          "campaignId": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PayoutReceiptListResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PayoutReceipt"
+            }
+          },
+          "nextCursor": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "RepoPayoutPolicy": {
+        "type": "object",
+        "required": [
+          "repoFullName",
+          "enabled",
+          "perPrAmountUsdc"
+        ],
+        "properties": {
+          "repoFullName": {
+            "type": "string",
+            "pattern": "^[^/]+/[^/]+$"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "sponsorPoolUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "perPrAmountUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "perReviewAmountUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "perReleaseAuthorAmountUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "maxPayoutPerPrUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "RepoPayoutPolicyListResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RepoPayoutPolicy"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpsertRepoPayoutPolicyRequest": {
+        "type": "object",
+        "required": [
+          "repoId",
+          "repoFullName",
+          "perPrAmountUsdc"
+        ],
+        "properties": {
+          "repoId": {
+            "type": "integer"
+          },
+          "repoFullName": {
+            "type": "string",
+            "pattern": "^[^/]+/[^/]+$"
+          },
+          "perPrAmountUsdc": {
+            "type": "number",
+            "minimum": 0.5,
+            "example": 10
+          },
+          "dailyCapUsdc": {
+            "type": "number",
+            "example": 50
+          },
+          "budgetRemainingUsdc": {
+            "type": "number",
+            "example": 120
+          },
+          "active": {
+            "type": "boolean",
+            "default": true
+          },
+          "bountyEnabled": {
+            "type": "boolean",
+            "example": true
+          },
+          "releasePoolUsdc": {
+            "type": "number",
+            "example": 20
+          },
+          "splitMode": {
+            "type": "string",
+            "enum": [
+              "equal",
+              "weighted_by_prs"
+            ],
+            "example": "equal"
+          },
+          "reviewAmountUsdc": {
+            "type": "number",
+            "example": 15
+          },
+          "reviewMinChars": {
+            "type": "integer",
+            "example": 20
+          },
+          "maxReviewersPerPr": {
+            "type": "integer",
+            "example": 2
+          }
+        },
+        "additionalProperties": false
+      },
+      "CitationSourceType": {
+        "type": "string",
+        "enum": [
+          "paywall_slug",
+          "external_url"
+        ]
+      },
+      "CitationSource": {
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "active"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/CitationSourceType"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CitationSourceListResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CitationSource"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "RegisterCitationSourceRequest": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/CitationSourceType"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "active": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "CitationDemoRunRequest": {
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1
+          },
+          "maxSources": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 5
+          }
+        },
+        "additionalProperties": false
+      },
+      "CitationDemoRunResponse": {
+        "type": "object",
+        "required": [
+          "answer",
+          "sources",
+          "payments"
+        ],
+        "properties": {
+          "answer": {
+            "type": "string"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CitationSource"
+            }
+          },
+          "payments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PayoutReceipt"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "TwitchWebhookResponse": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "challenge": {
+            "type": "string"
+          },
+          "ignored": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CampaignStatus": {
+        "type": "string",
+        "enum": [
+          "draft",
+          "active",
+          "paused",
+          "completed",
+          "cancelled"
+        ]
+      },
+      "TwitchCampaign": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "status",
+          "budgetUsdc"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CampaignStatus"
+          },
+          "budgetUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "spentUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "startsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TwitchCampaignListResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TwitchCampaign"
+            }
+          },
+          "nextCursor": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreateTwitchCampaignRequest": {
+        "type": "object",
+        "required": [
+          "sponsorId",
+          "broadcasterUserId",
+          "name",
+          "totalBudgetUsdc"
+        ],
+        "properties": {
+          "sponsorId": {
+            "type": "string",
+            "example": "lepton-demo"
+          },
+          "broadcasterUserId": {
+            "type": "string",
+            "example": "126247254"
+          },
+          "broadcasterLoginSnapshot": {
+            "type": "string",
+            "example": "kurdypel"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "example": "Raid-to-Pay Demo"
+          },
+          "totalBudgetUsdc": {
+            "type": "number",
+            "minimum": 0.5,
+            "example": 10
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "active",
+              "paused",
+              "ended"
+            ],
+            "default": "draft"
+          },
+          "startsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "sponsorWalletRef": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateTwitchCampaignRequest": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
+          "status": {
+            "$ref": "#/components/schemas/CampaignStatus"
+          },
+          "budgetUsdc": {
+            "$ref": "#/components/schemas/MoneyUsdc"
+          },
+          "startsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endsAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "minProperties": 1,
+        "additionalProperties": false
+      },
+      "TwitchPayoutPolicy": {
+        "type": "object",
+        "required": [
+          "campaignId",
+          "ratePerViewerUsdc",
+          "maxPerEventUsdc"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "campaignId": {
+            "type": "string"
+          },
+          "eventType": {
+            "type": "string",
+            "example": "channel.raid"
+          },
+          "payoutKind": {
+            "type": "string",
+            "example": "raid"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "minViewers": {
+            "type": "integer",
+            "minimum": 0,
+            "example": 5
+          },
+          "ratePerViewerUsdc": {
+            "type": "number",
+            "example": 0.01
+          },
+          "maxPerEventUsdc": {
+            "type": "number",
+            "example": 2
+          },
+          "maxPerDayUsdc": {
+            "type": "number",
+            "example": 10
+          },
+          "allowlistJson": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "TwitchPayoutPolicyListResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TwitchPayoutPolicy"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpsertTwitchPayoutPolicyRequest": {
+        "type": "object",
+        "required": [
+          "campaignId",
+          "ratePerViewerUsdc",
+          "maxPerEventUsdc"
+        ],
+        "properties": {
+          "campaignId": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "minViewers": {
+            "type": "integer",
+            "minimum": 0,
+            "example": 5
+          },
+          "ratePerViewerUsdc": {
+            "type": "number",
+            "example": 0.01,
+            "description": "USDC per raiding viewer; amount = min(viewers × rate, maxPerEventUsdc)"
+          },
+          "maxPerEventUsdc": {
+            "type": "number",
+            "example": 2
+          },
+          "maxPerDayUsdc": {
+            "type": "number",
+            "example": 10
+          },
+          "allowlistJson": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "TwitchIdentityResponse": {
+        "type": "object",
+        "required": [
+          "userId",
+          "identity",
+          "identityHash"
+        ],
+        "properties": {
+          "userId": {
+            "type": "string"
+          },
+          "login": {
+            "type": "string"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "identity": {
+            "type": "string",
+            "example": "twitch:uid:123456"
+          },
+          "identityHash": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "x-demo-pricing": {
+    "note": "Live demo snapshot (Jul 2026). Raid formula: min(viewers * ratePerViewerUsdc, maxPerEventUsdc).",
+    "githubRepoTreasury": {
+      "repoFullName": "Hazyshades/Sendly-Test-Repo",
+      "perPrAmountUsdc": 10,
+      "releasePoolUsdc": 20,
+      "reviewAmountUsdc": 15,
+      "dailyCapUsdc": 50,
+      "budgetRemainingUsdc": 120,
+      "bountyEnabled": true,
+      "reviewMinChars": 20,
+      "maxReviewersPerPr": 2
+    },
+    "twitchRaidToPay": {
+      "campaignBudgetUsdc": 10,
+      "minViewers": 5,
+      "ratePerViewerUsdc": 0.01,
+      "maxPerEventUsdc": 2,
+      "maxPerDayUsdc": 10,
+      "exampleRaidPayoutUsdc": 0.25,
+      "exampleRaidViewers": 25
+    }
+  },
+  "x-settlement": {
+    "chainId": "5042002",
+    "contractAddress": "0x33783a585504025e66b8f8f6451de0c23158a3cb",
+    "usdcAddress": "0x3600000000000000000000000000000000000000",
+    "method": "ZkSend.createPayment",
+    "platformSource": "Read platform and identityHash from the 402 response body or treasury receipt",
+    "supportedPlatforms": [
+      "github",
+      "twitch"
+    ],
+    "minPriceUsdc": "0.5"
+  }
+}
