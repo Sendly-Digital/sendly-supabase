@@ -504,28 +504,47 @@ app.get('/twitter/user', async (c) => {
       return c.json({ error: 'Missing or invalid query.username', code: 'MISSING_USERNAME' }, 400);
     }
 
+    const forceRefresh =
+      c.req.query('refresh') === '1' || c.req.query('refresh') === 'true';
+
     const client = getSupabaseClient();
 
-    const cacheCutoff = new Date();
-    cacheCutoff.setDate(cacheCutoff.getDate() - TWITTER_USER_CACHE_DAYS);
-    const cacheCutoffIso = cacheCutoff.toISOString();
+    const readAnyCache = async () => {
+      const { data: cached, error: cacheError } = await client
+        .from('twitter_user_cache')
+        .select('username, name, profile_image_url, updated_at')
+        .eq('username', username)
+        .maybeSingle();
+      if (cacheError) {
+        console.error('[zkSEND] Twitter cache read error:', cacheError);
+      }
+      return cached;
+    };
 
-    const { data: cached, error: cacheError } = await client
-      .from('twitter_user_cache')
-      .select('username, name, profile_image_url')
-      .eq('username', username)
-      .gte('updated_at', cacheCutoffIso)
-      .maybeSingle();
+    if (!forceRefresh) {
+      const cacheCutoff = new Date();
+      cacheCutoff.setDate(cacheCutoff.getDate() - TWITTER_USER_CACHE_DAYS);
+      const cacheCutoffIso = cacheCutoff.toISOString();
 
-    if (cacheError) {
-      console.error('[zkSEND] Twitter cache read error:', cacheError);
-    }
-    if (cached && cached.username) {
-      return c.json({
-        username: cached.username,
-        name: cached.name ?? cached.username,
-        profile_image_url: cached.profile_image_url ?? null,
-      });
+      const { data: cached, error: cacheError } = await client
+        .from('twitter_user_cache')
+        .select('username, name, profile_image_url, updated_at')
+        .eq('username', username)
+        .gte('updated_at', cacheCutoffIso)
+        .maybeSingle();
+
+      if (cacheError) {
+        console.error('[zkSEND] Twitter cache read error:', cacheError);
+      }
+      if (cached && cached.username) {
+        return c.json({
+          username: cached.username,
+          name: cached.name ?? cached.username,
+          profile_image_url: cached.profile_image_url ?? null,
+          updated_at: cached.updated_at ?? null,
+          from_cache: true,
+        });
+      }
     }
 
     let inFlightPromise = twitterUserInFlight.get(username);
@@ -535,6 +554,24 @@ app.get('/twitter/user', async (c) => {
       inFlightPromise.finally(() => twitterUserInFlight.delete(username));
     }
     const { status, body } = await inFlightPromise;
+
+    if (status === 200) {
+      return c.json({ ...body, from_cache: false });
+    }
+
+    // Refresh/API failure: fall back to any cached row so the client keeps working.
+    const stale = await readAnyCache();
+    if (stale?.username) {
+      return c.json({
+        username: stale.username,
+        name: stale.name ?? stale.username,
+        profile_image_url: stale.profile_image_url ?? null,
+        updated_at: stale.updated_at ?? null,
+        from_cache: true,
+        stale: true,
+      });
+    }
+
     return c.json(body, status);
   } catch (err) {
     console.error('[zkSEND] Twitter user lookup error:', err);
@@ -656,7 +693,9 @@ async function fetchTwitchUserFromApi(
     followersTotal = typeof followersData.total === 'number' ? followersData.total : 0;
   }
 
+  const helixId = String(user.id).trim();
   const payload = {
+    id: helixId,
     login: user.login,
     display_name: user.display_name ?? user.login,
     profile_image_url: user.profile_image_url ?? null,
@@ -664,11 +703,12 @@ async function fetchTwitchUserFromApi(
   };
 
   const cacheLogin = user.login.toLowerCase();
-  await client
+  const { error: upsertError } = await client
     .from('twitch_user_cache')
     .upsert(
       {
         login: cacheLogin,
+        helix_id: helixId,
         display_name: payload.display_name,
         profile_image_url: payload.profile_image_url,
         followers_total: payload.followers_total,
@@ -676,6 +716,9 @@ async function fetchTwitchUserFromApi(
       },
       { onConflict: 'login' }
     );
+  if (upsertError) {
+    console.error('[zkSEND] Twitch cache upsert error:', upsertError);
+  }
 
   return { status: 200, body: payload };
 }
@@ -696,7 +739,7 @@ app.get('/twitch/user', async (c) => {
 
     const { data: cached, error: cacheError } = await client
       .from('twitch_user_cache')
-      .select('login, display_name, profile_image_url, followers_total')
+      .select('login, helix_id, display_name, profile_image_url, followers_total')
       .eq('login', login)
       .gte('updated_at', cacheCutoffIso)
       .maybeSingle();
@@ -704,8 +747,10 @@ app.get('/twitch/user', async (c) => {
     if (cacheError) {
       console.error('[zkSEND] Twitch cache read error:', cacheError);
     }
-    if (cached && cached.login) {
+    const cachedHelixId = String(cached?.helix_id ?? '').trim();
+    if (cached?.login && cachedHelixId) {
       return c.json({
+        id: cachedHelixId,
         login: cached.login,
         display_name: cached.display_name ?? cached.login,
         profile_image_url: cached.profile_image_url ?? null,
