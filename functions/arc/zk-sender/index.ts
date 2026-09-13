@@ -904,6 +904,8 @@ app.get('/github/user', async (c) => {
 });
 
 const TELEGRAM_USER_CACHE_DAYS = 7;
+const TELEGRAM_AVATAR_BUCKET = 'telegram-avatars';
+const TELEGRAM_PHOTO_MAX_BYTES = 256 * 1024;
 
 /** In-flight Telegram user lookups by normalized username. */
 const telegramUserInFlight = new Map<
@@ -915,6 +917,60 @@ const telegramUserInFlight = new Map<
 function normalizeTelegramUsername(raw: string | null | undefined): string {
   if (raw == null || typeof raw !== 'string') return '';
   return raw.trim().replace(/^@/, '').toLowerCase();
+}
+
+function publicTelegramAvatarUrl(url: unknown): string | null {
+  if (typeof url !== 'string' || !url.trim()) return null;
+  if (url.includes('api.telegram.org/file/bot')) return null;
+  return url;
+}
+
+function decodeBase64Bytes(raw: string): Uint8Array | null {
+  try {
+    const bin = atob(raw);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+function telegramPhotoFromAttestator(body: Record<string, unknown>): {
+  bytes: Uint8Array;
+  contentType: string;
+  ext: string;
+} | null {
+  const b64Raw = typeof body.photo_base64 === 'string' ? body.photo_base64.trim() : '';
+  if (!b64Raw) return null;
+  const b64 = b64Raw.includes(',') ? b64Raw.slice(b64Raw.indexOf(',') + 1) : b64Raw;
+  const bytes = decodeBase64Bytes(b64);
+  if (!bytes || bytes.byteLength === 0 || bytes.byteLength > TELEGRAM_PHOTO_MAX_BYTES) return null;
+  const contentType =
+    typeof body.photo_content_type === 'string' && body.photo_content_type.startsWith('image/')
+      ? body.photo_content_type
+      : 'image/jpeg';
+  const ext =
+    contentType === 'image/png' ? 'png' : contentType === 'image/webp' ? 'webp' : contentType === 'image/gif' ? 'gif' : 'jpg';
+  return { bytes, contentType, ext };
+}
+
+async function uploadTelegramAvatar(
+  client: ReturnType<typeof getSupabaseClient>,
+  username: string,
+  photo: { bytes: Uint8Array; contentType: string; ext: string }
+): Promise<string | null> {
+  const path = `${username}.${photo.ext}`;
+  const { error } = await client.storage.from(TELEGRAM_AVATAR_BUCKET).upload(path, photo.bytes, {
+    contentType: photo.contentType,
+    upsert: true,
+  });
+  if (error) {
+    console.error('[zkSEND] Telegram avatar upload error:', error);
+    return null;
+  }
+  const { data } = client.storage.from(TELEGRAM_AVATAR_BUCKET).getPublicUrl(path);
+  return publicTelegramAvatarUrl(data?.publicUrl);
 }
 
 /** Fetch Telegram user from zktls-service and upsert into cache. Used when cache miss; shared by coalesced requests. */
@@ -951,10 +1007,12 @@ async function fetchTelegramUserFromZktls(
   }
 
   const payloadUsername = typeof body.username === 'string' ? body.username : username;
+  const photo = telegramPhotoFromAttestator(body);
+  const hostedUrl = photo ? await uploadTelegramAvatar(client, payloadUsername.toLowerCase(), photo) : null;
   const payload = {
     username: payloadUsername,
     name: (typeof body.name === 'string' ? body.name : payloadUsername) ?? payloadUsername,
-    profile_image_url: body.profile_image_url ?? null,
+    profile_image_url: hostedUrl ?? publicTelegramAvatarUrl(body.profile_image_url),
   };
 
   const cacheUsername = payloadUsername.toLowerCase();
