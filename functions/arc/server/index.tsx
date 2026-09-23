@@ -5509,8 +5509,8 @@ app.post('/wallets/create', async (c) => {
       return c.json({ error: 'Missing required field: userId' }, 400);
     }
 
-    // Validate blockchain
-    const supportedBlockchains = ['ARC-TESTNET', 'ETH-SEPOLIA', 'BASE-SEPOLIA', 'MATIC-AMOY', 'SOL-DEVNET'];
+    // Validate blockchain (ARC = Arc Mainnet DCW per Circle supported-blockchains)
+    const supportedBlockchains = ['ARC', 'ARC-TESTNET', 'ETH-SEPOLIA', 'BASE-SEPOLIA', 'MATIC-AMOY', 'SOL-DEVNET'];
     if (!supportedBlockchains.includes(blockchain)) {
       return c.json({ 
         error: 'Unsupported blockchain',
